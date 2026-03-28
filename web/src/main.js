@@ -77,6 +77,13 @@ const segmentPane = document.getElementById("segment-pane");
 const segmentGrid = document.getElementById("segment-grid");
 const progressBar = document.getElementById("progress-bar");
 const progressFill = document.getElementById("progress-fill");
+const maskOpacityInput = document.getElementById("maskOpacity");
+const maskOpacityVal = document.getElementById("maskOpacityVal");
+const outlineOpacityInput = document.getElementById("outlineOpacity");
+const outlineOpacityValEl = document.getElementById("outlineOpacityVal");
+const controlPanel = document.getElementById("control-panel");
+const panelToggle = document.getElementById("panel-toggle");
+const panelClose = document.getElementById("panelClose");
 
 // State
 let session = null;
@@ -90,6 +97,8 @@ let manifest = [];
 let currentModelId = null;
 let frameCount = 0;
 let showSegments = false;
+let maskOpacity = 0.4;
+let outlineOpacity = 0.85;
 
 let inputBuf = null;
 let prepCanvas = null;
@@ -186,6 +195,26 @@ backendSelect.addEventListener("change", () => {
   if (currentModelId) loadModel(currentModelId);
 });
 
+panelToggle.addEventListener("click", () => {
+  controlPanel.classList.toggle("collapsed");
+  panelToggle.style.display = controlPanel.classList.contains("collapsed") ? "" : "none";
+});
+
+panelClose.addEventListener("click", () => {
+  controlPanel.classList.add("collapsed");
+  panelToggle.style.display = "";
+});
+
+outlineOpacityInput.addEventListener("input", () => {
+  outlineOpacity = parseFloat(outlineOpacityInput.value);
+  outlineOpacityValEl.textContent = outlineOpacity.toFixed(2);
+});
+
+maskOpacityInput.addEventListener("input", () => {
+  maskOpacity = parseFloat(maskOpacityInput.value);
+  maskOpacityVal.textContent = maskOpacity.toFixed(2);
+});
+
 showSegmentsCheckbox.addEventListener("change", () => {
   showSegments = showSegmentsCheckbox.checked;
   segmentPane.classList.toggle("visible", showSegments);
@@ -193,7 +222,7 @@ showSegmentsCheckbox.addEventListener("change", () => {
     for (let i = 0; i < activeSegments; i++) segmentPool[i].style.display = "none";
     activeSegments = 0;
   }
-  syncOverlay();
+  deferredSyncOverlay();
 });
 
 fullscreenBtn.addEventListener("click", () => {
@@ -206,7 +235,7 @@ fullscreenBtn.addEventListener("click", () => {
 
 document.addEventListener("fullscreenchange", () => {
   videoPane.classList.toggle("fullscreen", !!document.fullscreenElement);
-  syncOverlay();
+  deferredSyncOverlay();
 });
 
 // --- Model loading ---
@@ -358,10 +387,18 @@ function postprocess(dets, labels, vidW, vidH) {
 
 // --- Drawing ---
 
+// Reusable owner map buffer — avoids allocation per frame
+let ownerBuf = null;
+let ownerBufSize = 0;
+
 function drawMasks(detections, masksData, maskDims, vidW, vidH) {
   const maskH = maskDims[2];
   const maskW = maskDims[3];
   const maskSize = maskH * maskW;
+  const fillAlpha = Math.round(maskOpacity * 255);
+  const edgeAlpha = Math.round(outlineOpacity * 255);
+
+  if (fillAlpha === 0 && edgeAlpha === 0) return;
 
   if (!maskCanvas || maskCanvas.width !== maskW || maskCanvas.height !== maskH) {
     maskCanvas = new OffscreenCanvas(maskW, maskH);
@@ -369,24 +406,57 @@ function drawMasks(detections, masksData, maskDims, vidW, vidH) {
     maskImgData = maskCtx.createImageData(maskW, maskH);
   }
 
+  // Reuse owner buffer
+  if (ownerBufSize !== maskSize) {
+    ownerBuf = new Int8Array(maskSize);
+    ownerBufSize = maskSize;
+  }
+  ownerBuf.fill(-1);
+
   const pixels = maskImgData.data;
   pixels.fill(0);
 
+  const nd = detections.length;
+
+  // Single pass: build owner map
+  for (let i = 0; i < maskSize; i++) {
+    for (let d = 0; d < nd; d++) {
+      if (masksData[detections[d].queryIdx * maskSize + i] > 0) {
+        ownerBuf[i] = d;
+        break;
+      }
+    }
+  }
+
+  // Single pass: fill pixels + edge detect
   for (let my = 0; my < maskH; my++) {
+    const rowOff = my * maskW;
     for (let mx = 0; mx < maskW; mx++) {
+      const o = ownerBuf[rowOff + mx];
+      if (o < 0) continue;
+
       const outX = maskW - 1 - mx;
-      const idx = (my * maskW + outX) * 4;
+      const idx = (rowOff + outX) << 2;
 
-      for (const det of detections) {
-        const val = masksData[det.queryIdx * maskSize + my * maskW + mx];
-        if (val <= 0) continue;
+      const isEdge = edgeAlpha > 0 && (
+        mx === 0 || mx === maskW - 1 || my === 0 || my === maskH - 1 ||
+        ownerBuf[rowOff - maskW + mx] !== o ||
+        ownerBuf[rowOff + maskW + mx] !== o ||
+        ownerBuf[rowOff + mx - 1] !== o ||
+        ownerBuf[rowOff + mx + 1] !== o
+      );
 
-        const [r, g, b, a] = COLOR_RGBA[det.classId];
+      if (isEdge) {
+        pixels[idx] = 255;
+        pixels[idx + 1] = 255;
+        pixels[idx + 2] = 255;
+        pixels[idx + 3] = edgeAlpha;
+      } else if (fillAlpha > 0) {
+        const [r, g, b] = COLOR_RGBA[detections[o].classId];
         pixels[idx] = r;
         pixels[idx + 1] = g;
         pixels[idx + 2] = b;
-        pixels[idx + 3] = a;
-        break;
+        pixels[idx + 3] = fillAlpha;
       }
     }
   }
@@ -531,20 +601,46 @@ function updateSidebar(detections, masksData, maskDims, vidW, vidH) {
 }
 
 // --- Overlay positioning ---
+// object-fit:contain means the video element has black bars.
+// We compute the actual rendered content rect from the native aspect ratio.
 function syncOverlay() {
-  const vidRect = video.getBoundingClientRect();
+  const elemRect = video.getBoundingClientRect();
+  const nativeW = video.videoWidth;
+  const nativeH = video.videoHeight;
+  if (!nativeW || !nativeH) return;
+
+  const elemW = elemRect.width;
+  const elemH = elemRect.height;
+  const scale = Math.min(elemW / nativeW, elemH / nativeH);
+  const renderedW = nativeW * scale;
+  const renderedH = nativeH * scale;
+  // Center offset within the element
+  const offsetX = (elemW - renderedW) / 2;
+  const offsetY = (elemH - renderedH) / 2;
+
   const paneRect = videoPane.getBoundingClientRect();
 
-  overlay.width = video.videoWidth;
-  overlay.height = video.videoHeight;
-  overlay.style.width = vidRect.width + "px";
-  overlay.style.height = vidRect.height + "px";
-  overlay.style.left = (vidRect.left - paneRect.left) + "px";
-  overlay.style.top = (vidRect.top - paneRect.top) + "px";
+  overlay.width = nativeW;
+  overlay.height = nativeH;
+  overlay.style.width = renderedW + "px";
+  overlay.style.height = renderedH + "px";
+  overlay.style.left = (elemRect.left - paneRect.left + offsetX) + "px";
+  overlay.style.top = (elemRect.top - paneRect.top + offsetY) + "px";
 }
 
-const resizeObserver = new ResizeObserver(() => { if (running) syncOverlay(); });
+let syncPending = false;
+function deferredSyncOverlay() {
+  if (!running || syncPending) return;
+  syncPending = true;
+  requestAnimationFrame(() => {
+    syncOverlay();
+    syncPending = false;
+  });
+}
+
+const resizeObserver = new ResizeObserver(deferredSyncOverlay);
 resizeObserver.observe(videoPane);
+window.addEventListener("resize", deferredSyncOverlay);
 
 // --- Main loop ---
 
@@ -605,6 +701,8 @@ async function startCamera() {
   await video.play();
 
   placeholder.classList.add("hidden");
+  // Wait a frame for layout to settle before measuring video rect
+  await new Promise(r => requestAnimationFrame(r));
   syncOverlay();
 
   running = true;
@@ -617,5 +715,8 @@ startBtn.addEventListener("click", startCamera);
 startBtnLarge.addEventListener("click", startCamera);
 
 // --- Init ---
+
+// Panel starts open, hide the gear toggle
+panelToggle.style.display = "none";
 
 loadManifest().then(defaultModel => loadModel(defaultModel));

@@ -1,4 +1,10 @@
 [
-  { "id": "nano", "label": "Nano - Detection", "resolution": 384 },
-  { "id": "seg-nano", "label": "Nano - Segmentation", "resolution": 312 }
+  { "id": "seg-nano", "label": "Seg Nano", "resolution": 312 },
+  { "id": "seg-small", "label": "Seg Small", "resolution": 384 },
+  { "id": "seg-medium", "label": "Seg Medium", "resolution": 432 },
+  { "id": "seg-large", "label": "Seg Large", "resolution": 504 },
+  { "id": "nano", "label": "Det Nano", "resolution": 384 },
+  { "id": "small", "label": "Det Small", "resolution": 512 },
+  { "id": "medium", "label": "Det Medium", "resolution": 576 },
+  { "id": "large", "label": "Det Large", "resolution": 704 }
 ]

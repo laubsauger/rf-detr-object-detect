@@ -1,6 +1,10 @@
 import * as ort from "onnxruntime-web";
 
 ort.env.logLevel = "error";
+ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+
+const threadsOk = typeof SharedArrayBuffer !== "undefined";
+console.log(`[ORT] Threading: ${threadsOk ? "enabled" : "DISABLED (no SharedArrayBuffer)"}, cores: ${navigator.hardwareConcurrency}`);
 
 // ONNX model outputs 91 classes (COCO category IDs 0-90, index 0 is background)
 const COCO_CLASSES = new Array(91).fill(null);
@@ -56,16 +60,23 @@ const STD = [0.229, 0.224, 0.225];
 const video = document.getElementById("video");
 const overlay = document.getElementById("overlay");
 const ctx = overlay.getContext("2d");
-const container = document.getElementById("container");
+const videoPane = document.getElementById("video-pane");
+const placeholder = document.getElementById("video-placeholder");
 const statusEl = document.getElementById("status");
 const statsEl = document.getElementById("stats");
 const startBtn = document.getElementById("startBtn");
+const startBtnLarge = document.getElementById("startBtnLarge");
 const thresholdInput = document.getElementById("threshold");
 const threshValEl = document.getElementById("threshVal");
 const badgeEl = document.getElementById("backend-badge");
 const modelSelect = document.getElementById("modelSelect");
 const backendSelect = document.getElementById("backendSelect");
 const fullscreenBtn = document.getElementById("fullscreenBtn");
+const showSegmentsCheckbox = document.getElementById("showSegments");
+const segmentPane = document.getElementById("segment-pane");
+const segmentGrid = document.getElementById("segment-grid");
+const progressBar = document.getElementById("progress-bar");
+const progressFill = document.getElementById("progress-fill");
 
 // State
 let session = null;
@@ -77,13 +88,88 @@ let inputSize = 384;
 let loading = false;
 let manifest = [];
 let currentModelId = null;
+let frameCount = 0;
+let showSegments = false;
 
 let inputBuf = null;
 let prepCanvas = null;
 let prepCtx = null;
+
 let maskCanvas = null;
 let maskCtx = null;
 let maskImgData = null;
+
+const segmentPool = [];
+let activeSegments = 0;
+
+let frameCanvas = null;
+let frameCtx = null;
+
+// Model blob cache — downloaded once, reused across backend switches
+const modelCache = new Map();
+
+function getSegmentEl(index) {
+  if (index < segmentPool.length) return segmentPool[index];
+  const el = document.createElement("div");
+  el.className = "segment";
+  const canvas = document.createElement("canvas");
+  const label = document.createElement("div");
+  label.className = "seg-label";
+  el.appendChild(canvas);
+  el.appendChild(label);
+  segmentPool.push(el);
+  return el;
+}
+
+// --- Progress bar ---
+
+function showProgress(pct) {
+  progressBar.classList.add("active");
+  progressFill.style.width = pct + "%";
+}
+
+function hideProgress() {
+  progressBar.classList.remove("active");
+  progressFill.style.width = "0%";
+}
+
+async function fetchModelWithProgress(url) {
+  if (modelCache.has(url)) return modelCache.get(url);
+
+  const response = await fetch(url);
+  const contentLength = response.headers.get("Content-Length");
+  const total = contentLength ? parseInt(contentLength, 10) : 0;
+
+  if (!response.body || !total) {
+    // No streaming support or unknown size — just download
+    const buf = await response.arrayBuffer();
+    modelCache.set(url, buf);
+    return buf;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    showProgress((received / total) * 100);
+  }
+
+  const buf = new ArrayBuffer(received);
+  const view = new Uint8Array(buf);
+  let offset = 0;
+  for (const chunk of chunks) {
+    view.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  modelCache.set(url, buf);
+  return buf;
+}
 
 // --- Controls ---
 
@@ -100,16 +186,27 @@ backendSelect.addEventListener("change", () => {
   if (currentModelId) loadModel(currentModelId);
 });
 
+showSegmentsCheckbox.addEventListener("change", () => {
+  showSegments = showSegmentsCheckbox.checked;
+  segmentPane.classList.toggle("visible", showSegments);
+  if (!showSegments) {
+    for (let i = 0; i < activeSegments; i++) segmentPool[i].style.display = "none";
+    activeSegments = 0;
+  }
+  syncOverlay();
+});
+
 fullscreenBtn.addEventListener("click", () => {
   if (document.fullscreenElement) {
     document.exitFullscreen();
   } else {
-    container.requestFullscreen();
+    videoPane.requestFullscreen();
   }
 });
 
 document.addEventListener("fullscreenchange", () => {
-  container.classList.toggle("fullscreen", !!document.fullscreenElement);
+  videoPane.classList.toggle("fullscreen", !!document.fullscreenElement);
+  syncOverlay();
 });
 
 // --- Model loading ---
@@ -119,6 +216,7 @@ async function loadModel(modelId) {
   loading = true;
   modelSelect.disabled = true;
   startBtn.disabled = true;
+  startBtnLarge.disabled = true;
   currentModelId = modelId;
 
   const meta = manifest.find(m => m.id === modelId);
@@ -126,7 +224,6 @@ async function loadModel(modelId) {
 
   const modelUrl = `/models/${modelId}/inference_model.onnx`;
   const preferredBackend = backendSelect.value;
-
   const backends = preferredBackend === "auto"
     ? ["webgpu", "wasm"]
     : [preferredBackend];
@@ -134,11 +231,28 @@ async function loadModel(modelId) {
   session = null;
   activeBackend = null;
 
+  // Download model with progress (cached after first download)
+  let modelData;
+  try {
+    statusEl.childNodes[0].textContent = `Downloading ${meta.label}...`;
+    modelData = await fetchModelWithProgress(modelUrl);
+    hideProgress();
+  } catch (e) {
+    statusEl.childNodes[0].textContent = `Download failed: ${e.message}`;
+    hideProgress();
+    loading = false;
+    modelSelect.disabled = false;
+    return;
+  }
+
   for (const backend of backends) {
     try {
-      statusEl.childNodes[0].textContent = `Loading ${meta.label} (${backend})...`;
-      session = await ort.InferenceSession.create(modelUrl, {
+      statusEl.childNodes[0].textContent = `Initializing ${meta.label} (${backend})...`;
+      session = await ort.InferenceSession.create(modelData, {
         executionProviders: [backend],
+        graphOptimizationLevel: "all",
+        enableCpuMemArena: true,
+        enableMemPattern: true,
       });
       activeBackend = backend;
       break;
@@ -148,7 +262,7 @@ async function loadModel(modelId) {
   }
 
   if (!session) {
-    statusEl.childNodes[0].textContent = "Failed to load model with selected backend.";
+    statusEl.childNodes[0].textContent = "Failed to load model.";
     loading = false;
     modelSelect.disabled = false;
     return;
@@ -160,11 +274,15 @@ async function loadModel(modelId) {
   prepCanvas = new OffscreenCanvas(inputSize, inputSize);
   prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
 
+  maskCanvas = null;
+  maskImgData = null;
+
   const modelType = hasSegmentation ? "Seg" : "Det";
   badgeEl.textContent = activeBackend.toUpperCase();
   badgeEl.className = activeBackend;
   statusEl.childNodes[0].textContent = `${meta.label} (${inputSize}px, ${modelType}) `;
   startBtn.disabled = false;
+  startBtnLarge.disabled = false;
   modelSelect.disabled = false;
   loading = false;
 }
@@ -245,51 +363,36 @@ function drawMasks(detections, masksData, maskDims, vidW, vidH) {
   const maskW = maskDims[3];
   const maskSize = maskH * maskW;
 
-  if (!maskCanvas || maskCanvas.width !== vidW || maskCanvas.height !== vidH) {
-    maskCanvas = new OffscreenCanvas(vidW, vidH);
+  if (!maskCanvas || maskCanvas.width !== maskW || maskCanvas.height !== maskH) {
+    maskCanvas = new OffscreenCanvas(maskW, maskH);
     maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
-    maskImgData = maskCtx.createImageData(vidW, vidH);
+    maskImgData = maskCtx.createImageData(maskW, maskH);
   }
 
   const pixels = maskImgData.data;
   pixels.fill(0);
 
-  // Iterate over output pixels and sample from the mask (not the other way around)
-  // This avoids gaps from upscaling a small mask (78x78) to video resolution
-  for (let py = 0; py < vidH; py++) {
-    const my = (py / vidH) * maskH;
-    const myFloor = Math.min(Math.floor(my), maskH - 1);
-
-    for (let px = 0; px < vidW; px++) {
-      // Mirror x: video is CSS-flipped, so sample from the right side for left pixels
-      const srcX = (vidW - 1 - px) / vidW;
-      const mx = Math.min(Math.floor(srcX * maskW), maskW - 1);
-
-      const idx = (py * vidW + px) * 4;
+  for (let my = 0; my < maskH; my++) {
+    for (let mx = 0; mx < maskW; mx++) {
+      const outX = maskW - 1 - mx;
+      const idx = (my * maskW + outX) * 4;
 
       for (const det of detections) {
-        const val = masksData[det.queryIdx * maskSize + myFloor * maskW + mx];
+        const val = masksData[det.queryIdx * maskSize + my * maskW + mx];
         if (val <= 0) continue;
 
         const [r, g, b, a] = COLOR_RGBA[det.classId];
-        if (pixels[idx + 3] === 0) {
-          pixels[idx] = r;
-          pixels[idx + 1] = g;
-          pixels[idx + 2] = b;
-          pixels[idx + 3] = a;
-        } else {
-          pixels[idx] = (pixels[idx] + r) >> 1;
-          pixels[idx + 1] = (pixels[idx + 1] + g) >> 1;
-          pixels[idx + 2] = (pixels[idx + 2] + b) >> 1;
-          pixels[idx + 3] = Math.min(255, pixels[idx + 3] + a);
-        }
-        break; // top detection wins this pixel
+        pixels[idx] = r;
+        pixels[idx + 1] = g;
+        pixels[idx + 2] = b;
+        pixels[idx + 3] = a;
+        break;
       }
     }
   }
 
   maskCtx.putImageData(maskImgData, 0, 0);
-  ctx.drawImage(maskCanvas, 0, 0);
+  ctx.drawImage(maskCanvas, 0, 0, vidW, vidH);
 }
 
 function drawDetections(detections, w, h, masksData, maskDims) {
@@ -321,6 +424,128 @@ function drawDetections(detections, w, h, masksData, maskDims) {
   }
 }
 
+// --- Sidebar segments ---
+
+function updateSidebar(detections, masksData, maskDims, vidW, vidH) {
+  if (!masksData || !maskDims) {
+    for (let i = 0; i < activeSegments; i++) segmentPool[i].style.display = "none";
+    activeSegments = 0;
+    return;
+  }
+
+  const maskH = maskDims[2];
+  const maskW = maskDims[3];
+  const maskSize = maskH * maskW;
+
+  const withArea = detections.map(det => {
+    let area = 0;
+    const offset = det.queryIdx * maskSize;
+    for (let i = 0; i < maskSize; i++) {
+      if (masksData[offset + i] > 0) area++;
+    }
+    return { ...det, maskArea: area };
+  });
+
+  withArea.sort((a, b) => b.maskArea - a.maskArea || b.score - a.score);
+
+  if (!frameCanvas || frameCanvas.width !== vidW || frameCanvas.height !== vidH) {
+    frameCanvas = new OffscreenCanvas(vidW, vidH);
+    frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
+  }
+  frameCtx.save();
+  frameCtx.translate(vidW, 0);
+  frameCtx.scale(-1, 1);
+  frameCtx.drawImage(video, 0, 0, vidW, vidH);
+  frameCtx.restore();
+
+  const count = withArea.length;
+
+  for (let i = 0; i < count; i++) {
+    const det = withArea[i];
+    const el = getSegmentEl(i);
+
+    const bx = Math.max(0, Math.floor(det.x1));
+    const by = Math.max(0, Math.floor(det.y1));
+    const bw = Math.min(vidW - bx, Math.ceil(det.x2 - det.x1));
+    const bh = Math.min(vidH - by, Math.ceil(det.y2 - det.y1));
+
+    if (bw <= 0 || bh <= 0) {
+      el.style.display = "none";
+      continue;
+    }
+
+    const canvas = el.children[0];
+    const label = el.children[1];
+
+    canvas.width = bw;
+    canvas.height = bh;
+    const cctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    cctx.drawImage(frameCanvas, bx, by, bw, bh, 0, 0, bw, bh);
+
+    const imgData = cctx.getImageData(0, 0, bw, bh);
+    const px = imgData.data;
+
+    for (let py = 0; py < bh; py++) {
+      const vidY = by + py;
+      const my = Math.min(Math.floor((vidY / vidH) * maskH), maskH - 1);
+
+      for (let pxx = 0; pxx < bw; pxx++) {
+        const vidX = bx + pxx;
+        const origX = vidW - 1 - vidX;
+        const mx = Math.min(Math.floor((origX / vidW) * maskW), maskW - 1);
+        const maskIdx = my * maskW + mx;
+
+        const val = masksData[det.queryIdx * maskSize + maskIdx];
+        let occluded = false;
+        if (val > 0) {
+          for (let j = 0; j < count; j++) {
+            if (j === i) continue;
+            const other = withArea[j];
+            if (masksData[other.queryIdx * maskSize + maskIdx] > 0 && other.score > det.score) {
+              occluded = true;
+              break;
+            }
+          }
+        }
+
+        if (val <= 0 || occluded) {
+          const idx = (py * bw + pxx) * 4;
+          px[idx + 3] = 0;
+        }
+      }
+    }
+
+    cctx.putImageData(imgData, 0, 0);
+
+    const areaPercent = ((det.maskArea / maskSize) * 100).toFixed(1);
+    label.textContent = `${COCO_CLASSES[det.classId]} ${det.score.toFixed(2)} (${areaPercent}%)`;
+    label.style.color = COLORS[det.classId];
+
+    el.style.display = "";
+    if (!el.parentNode) segmentGrid.appendChild(el);
+  }
+
+  for (let i = count; i < activeSegments; i++) segmentPool[i].style.display = "none";
+  activeSegments = count;
+}
+
+// --- Overlay positioning ---
+function syncOverlay() {
+  const vidRect = video.getBoundingClientRect();
+  const paneRect = videoPane.getBoundingClientRect();
+
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+  overlay.style.width = vidRect.width + "px";
+  overlay.style.height = vidRect.height + "px";
+  overlay.style.left = (vidRect.left - paneRect.left) + "px";
+  overlay.style.top = (vidRect.top - paneRect.top) + "px";
+}
+
+const resizeObserver = new ResizeObserver(() => { if (running) syncOverlay(); });
+resizeObserver.observe(videoPane);
+
 // --- Main loop ---
 
 async function detectLoop() {
@@ -331,13 +556,11 @@ async function detectLoop() {
   const inputTensor = preprocess(video);
   const output = await session.run({ input: inputTensor });
 
-  // Copy data out before releasing tensors
   const detsData = output.dets.data;
   const labelsData = output.labels.data;
   const masksData = hasSegmentation ? output.masks.data : null;
   const maskDims = hasSegmentation ? output.masks.dims : null;
 
-  // Release ORT GPU/WASM tensor memory to prevent leaks
   inputTensor.dispose();
   output.dets.dispose();
   output.labels.dispose();
@@ -349,6 +572,11 @@ async function detectLoop() {
   const detections = postprocess(detsData, labelsData, vidW, vidH);
   drawDetections(detections, overlay.width, overlay.height, masksData, maskDims);
 
+  frameCount++;
+  if (showSegments && frameCount % 3 === 0) {
+    updateSidebar(detections, masksData, maskDims, vidW, vidH);
+  }
+
   const elapsed = performance.now() - t0;
   const mode = hasSegmentation ? "seg" : "det";
   statsEl.textContent = `${elapsed.toFixed(0)}ms | ${(1000 / elapsed).toFixed(1)} FPS | ${detections.length} objects | ${mode}`;
@@ -356,31 +584,37 @@ async function detectLoop() {
   requestAnimationFrame(detectLoop);
 }
 
-startBtn.addEventListener("click", async () => {
+// --- Camera start/stop ---
+
+async function startCamera() {
   if (running) {
     running = false;
     startBtn.textContent = "Start Camera";
+    startBtnLarge.textContent = "Start Camera";
     video.srcObject?.getTracks().forEach(t => t.stop());
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     statsEl.textContent = "";
+    placeholder.classList.remove("hidden");
     return;
   }
 
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
   });
   video.srcObject = stream;
   await video.play();
 
-  overlay.width = video.videoWidth;
-  overlay.height = video.videoHeight;
-  container.style.width = video.videoWidth + "px";
-  container.style.height = video.videoHeight + "px";
+  placeholder.classList.add("hidden");
+  syncOverlay();
 
   running = true;
   startBtn.textContent = "Stop";
+  startBtnLarge.textContent = "Stop";
   detectLoop();
-});
+}
+
+startBtn.addEventListener("click", startCamera);
+startBtnLarge.addEventListener("click", startCamera);
 
 // --- Init ---
 

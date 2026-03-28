@@ -1,0 +1,22 @@
+{
+    "sourceFile": "cam-detect.py",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 1,
+            "patches": [
+                {
+                    "date": 1774646166821,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1774646235496,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,10 +1,10 @@\n import cv2\n import supervision as sv\n-from rfdetr import RFDETRMedium\n+from rfdetr import RFDETRNano\n from rfdetr.assets.coco_classes import COCO_CLASSES\n \n-model = RFDETRMedium()\n+model = RFDETRNano()\n \n cap = cv2.VideoCapture(0)\n while True:\n     success, frame = cap.read()\n"
+                }
+            ],
+            "date": 1774646166821,
+            "name": "Commit-0",
+            "content": "import cv2\nimport supervision as sv\nfrom rfdetr import RFDETRMedium\nfrom rfdetr.assets.coco_classes import COCO_CLASSES\n\nmodel = RFDETRMedium()\n\ncap = cv2.VideoCapture(0)\nwhile True:\n    success, frame = cap.read()\n    if not success:\n        break\n\n    detections = model.predict(frame[:, :, ::-1], threshold=0.5)\n\n    labels = [\n        f\"{COCO_CLASSES[class_id]} {confidence:.2f}\"\n        for class_id, confidence in zip(detections.class_id, detections.confidence)\n    ]\n\n    annotated_frame = frame.copy()\n    annotated_frame = sv.BoxAnnotator().annotate(annotated_frame, detections)\n    annotated_frame = sv.LabelAnnotator().annotate(annotated_frame, detections, labels)\n\n    cv2.imshow(\"Webcam\", annotated_frame)\n\n    if cv2.waitKey(1) & 0xFF == ord(\"q\"):\n        break\n\ncap.release()\ncv2.destroyAllWindows()\n"
+        }
+    ]
+}

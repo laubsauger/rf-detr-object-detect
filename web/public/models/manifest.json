@@ -1,0 +1,4 @@
+[
+  { "id": "nano", "label": "Nano - Detection", "resolution": 384 },
+  { "id": "seg-nano", "label": "Nano - Segmentation", "resolution": 312 }
+]

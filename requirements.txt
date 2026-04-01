@@ -1,0 +1,7 @@
+rfdetr>=1.6.2
+supervision>=0.27.0
+opencv-python>=4.13.0
+torch>=2.11.0
+torchvision>=0.26.0
+onnx>=1.21.0
+onnxruntime>=1.24.0

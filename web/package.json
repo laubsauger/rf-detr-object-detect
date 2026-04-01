@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "setup:models": "python ../setup_models.py",
+    "postinstall": "python ../setup_models.py",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"

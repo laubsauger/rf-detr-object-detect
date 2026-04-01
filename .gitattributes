@@ -1,0 +1,17 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Binary model files — must never be modified by git
+*.onnx binary
+*.pth binary
+*.pt binary
+*.bin binary
+*.weights binary
+
+# Other binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.wasm binary

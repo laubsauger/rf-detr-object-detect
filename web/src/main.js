@@ -143,6 +143,7 @@ async function fetchModelWithProgress(url) {
   if (modelCache.has(url)) return modelCache.get(url);
 
   const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
   const contentLength = response.headers.get("Content-Length");
   const total = contentLength ? parseInt(contentLength, 10) : 0;
 

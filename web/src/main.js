@@ -104,9 +104,6 @@ let inputBuf = null;
 let prepCanvas = null;
 let prepCtx = null;
 
-let maskCanvas = null;
-let maskCtx = null;
-let maskImgData = null;
 
 const segmentPool = [];
 let activeSegments = 0;
@@ -303,9 +300,6 @@ async function loadModel(modelId) {
   prepCanvas = new OffscreenCanvas(inputSize, inputSize);
   prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
 
-  maskCanvas = null;
-  maskImgData = null;
-
   const modelType = hasSegmentation ? "Seg" : "Det";
   badgeEl.textContent = activeBackend.toUpperCase();
   badgeEl.className = activeBackend;
@@ -387,82 +381,156 @@ function postprocess(dets, labels, vidW, vidH) {
 
 // --- Drawing ---
 
-// Reusable owner map buffer — avoids allocation per frame
-let ownerBuf = null;
-let ownerBufSize = 0;
+// --- Mask-to-polygon contour tracing (marching squares) ---
+
+function traceContours(mask, w, h) {
+  // Returns array of polygons, each polygon is array of [x, y] points
+  // Uses simple contour tracing: scan for boundary pixels and follow edges
+  const visited = new Uint8Array(w * h);
+  const contours = [];
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!mask[y * w + x] || visited[y * w + x]) continue;
+      // Check if boundary pixel (has at least one non-mask neighbor)
+      const isBoundary =
+        x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
+        !mask[(y - 1) * w + x] || !mask[(y + 1) * w + x] ||
+        !mask[y * w + (x - 1)] || !mask[y * w + (x + 1)];
+      if (!isBoundary) continue;
+
+      // Trace boundary using Moore neighborhood
+      const contour = [];
+      const dirs = [[-1,0],[-1,1],[0,1],[1,1],[1,0],[1,-1],[0,-1],[-1,-1]];
+      let cx = x, cy = y, dir = 0;
+      const startKey = cy * w + cx;
+      let steps = 0;
+      const maxSteps = w * h;
+
+      do {
+        contour.push([cx, cy]);
+        visited[cy * w + cx] = 1;
+        let found = false;
+
+        // Search clockwise from (dir + 5) % 8 for next boundary pixel
+        const startDir = (dir + 5) % 8;
+        for (let i = 0; i < 8; i++) {
+          const d = (startDir + i) % 8;
+          const nx = cx + dirs[d][1];
+          const ny = cy + dirs[d][0];
+          if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny * w + nx]) {
+            cx = nx;
+            cy = ny;
+            dir = d;
+            found = true;
+            break;
+          }
+        }
+        if (!found) break;
+        steps++;
+      } while ((cy * w + cx !== startKey) && steps < maxSteps);
+
+      if (contour.length >= 3) {
+        contours.push(contour);
+      }
+    }
+  }
+  return contours;
+}
+
+// Douglas-Peucker polygon simplification
+function simplifyPolygon(points, epsilon) {
+  if (points.length <= 3) return points;
+
+  let maxDist = 0, maxIdx = 0;
+  const start = points[0], end = points[points.length - 1];
+  const dx = end[0] - start[0], dy = end[1] - start[1];
+  const lenSq = dx * dx + dy * dy;
+
+  for (let i = 1; i < points.length - 1; i++) {
+    let dist;
+    if (lenSq === 0) {
+      const ex = points[i][0] - start[0], ey = points[i][1] - start[1];
+      dist = Math.sqrt(ex * ex + ey * ey);
+    } else {
+      const t = Math.max(0, Math.min(1, ((points[i][0] - start[0]) * dx + (points[i][1] - start[1]) * dy) / lenSq));
+      const px = start[0] + t * dx - points[i][0];
+      const py = start[1] + t * dy - points[i][1];
+      dist = Math.sqrt(px * px + py * py);
+    }
+    if (dist > maxDist) { maxDist = dist; maxIdx = i; }
+  }
+
+  if (maxDist > epsilon) {
+    const left = simplifyPolygon(points.slice(0, maxIdx + 1), epsilon);
+    const right = simplifyPolygon(points.slice(maxIdx), epsilon);
+    return left.slice(0, -1).concat(right);
+  }
+  return [start, end];
+}
 
 function drawMasks(detections, masksData, maskDims, vidW, vidH) {
   const maskH = maskDims[2];
   const maskW = maskDims[3];
   const maskSize = maskH * maskW;
-  const fillAlpha = Math.round(maskOpacity * 255);
-  const edgeAlpha = Math.round(outlineOpacity * 255);
 
-  if (fillAlpha === 0 && edgeAlpha === 0) return;
+  if (maskOpacity === 0 && outlineOpacity === 0) return;
 
-  if (!maskCanvas || maskCanvas.width !== maskW || maskCanvas.height !== maskH) {
-    maskCanvas = new OffscreenCanvas(maskW, maskH);
-    maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
-    maskImgData = maskCtx.createImageData(maskW, maskH);
-  }
+  // Scale factors from mask coords to video coords (mirrored)
+  const sx = vidW / maskW;
+  const sy = vidH / maskH;
 
-  // Reuse owner buffer
-  if (ownerBufSize !== maskSize) {
-    ownerBuf = new Int8Array(maskSize);
-    ownerBufSize = maskSize;
-  }
-  ownerBuf.fill(-1);
+  // Build a binary mask per detection and extract contours
+  const binaryMask = new Uint8Array(maskSize);
 
-  const pixels = maskImgData.data;
-  pixels.fill(0);
+  for (const det of detections) {
+    const offset = det.queryIdx * maskSize;
 
-  const nd = detections.length;
+    // Build binary mask for this detection
+    binaryMask.fill(0);
+    for (let i = 0; i < maskSize; i++) {
+      if (masksData[offset + i] > 0) binaryMask[i] = 1;
+    }
 
-  // Single pass: build owner map
-  for (let i = 0; i < maskSize; i++) {
-    for (let d = 0; d < nd; d++) {
-      if (masksData[detections[d].queryIdx * maskSize + i] > 0) {
-        ownerBuf[i] = d;
-        break;
+    // Extract contours and simplify
+    const contours = traceContours(binaryMask, maskW, maskH);
+
+    for (const contour of contours) {
+      // Simplify polygon (epsilon=1 in mask space)
+      const simplified = simplifyPolygon(contour, 1.0);
+      if (simplified.length < 3) continue;
+
+      // Build canvas path — mirror x coords to match CSS-flipped video
+      ctx.beginPath();
+      const x0 = (maskW - 1 - simplified[0][0]) * sx;
+      const y0 = simplified[0][1] * sy;
+      ctx.moveTo(x0, y0);
+      for (let i = 1; i < simplified.length; i++) {
+        const px = (maskW - 1 - simplified[i][0]) * sx;
+        const py = simplified[i][1] * sy;
+        ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+
+      // Fill
+      if (maskOpacity > 0) {
+        ctx.globalAlpha = maskOpacity;
+        ctx.fillStyle = COLORS[det.classId];
+        ctx.fill();
+      }
+
+      // Outline
+      if (outlineOpacity > 0) {
+        ctx.globalAlpha = outlineOpacity;
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2;
+        ctx.lineJoin = "round";
+        ctx.stroke();
       }
     }
   }
 
-  // Single pass: fill pixels + edge detect
-  for (let my = 0; my < maskH; my++) {
-    const rowOff = my * maskW;
-    for (let mx = 0; mx < maskW; mx++) {
-      const o = ownerBuf[rowOff + mx];
-      if (o < 0) continue;
-
-      const outX = maskW - 1 - mx;
-      const idx = (rowOff + outX) << 2;
-
-      const isEdge = edgeAlpha > 0 && (
-        mx === 0 || mx === maskW - 1 || my === 0 || my === maskH - 1 ||
-        ownerBuf[rowOff - maskW + mx] !== o ||
-        ownerBuf[rowOff + maskW + mx] !== o ||
-        ownerBuf[rowOff + mx - 1] !== o ||
-        ownerBuf[rowOff + mx + 1] !== o
-      );
-
-      if (isEdge) {
-        pixels[idx] = 255;
-        pixels[idx + 1] = 255;
-        pixels[idx + 2] = 255;
-        pixels[idx + 3] = edgeAlpha;
-      } else if (fillAlpha > 0) {
-        const [r, g, b] = COLOR_RGBA[detections[o].classId];
-        pixels[idx] = r;
-        pixels[idx + 1] = g;
-        pixels[idx + 2] = b;
-        pixels[idx + 3] = fillAlpha;
-      }
-    }
-  }
-
-  maskCtx.putImageData(maskImgData, 0, 0);
-  ctx.drawImage(maskCanvas, 0, 0, vidW, vidH);
+  ctx.globalAlpha = 1;
 }
 
 function drawDetections(detections, w, h, masksData, maskDims) {
@@ -601,31 +669,14 @@ function updateSidebar(detections, masksData, maskDims, vidW, vidH) {
 }
 
 // --- Overlay positioning ---
-// object-fit:contain means the video element has black bars.
-// We compute the actual rendered content rect from the native aspect ratio.
+// Canvas has the same CSS sizing (inset:0, 100%x100%, object-fit:contain) as the video,
+// so the browser handles positioning identically. We just set the pixel resolution.
 function syncOverlay() {
-  const elemRect = video.getBoundingClientRect();
   const nativeW = video.videoWidth;
   const nativeH = video.videoHeight;
   if (!nativeW || !nativeH) return;
-
-  const elemW = elemRect.width;
-  const elemH = elemRect.height;
-  const scale = Math.min(elemW / nativeW, elemH / nativeH);
-  const renderedW = nativeW * scale;
-  const renderedH = nativeH * scale;
-  // Center offset within the element
-  const offsetX = (elemW - renderedW) / 2;
-  const offsetY = (elemH - renderedH) / 2;
-
-  const paneRect = videoPane.getBoundingClientRect();
-
   overlay.width = nativeW;
   overlay.height = nativeH;
-  overlay.style.width = renderedW + "px";
-  overlay.style.height = renderedH + "px";
-  overlay.style.left = (elemRect.left - paneRect.left + offsetX) + "px";
-  overlay.style.top = (elemRect.top - paneRect.top + offsetY) + "px";
 }
 
 let syncPending = false;
@@ -650,7 +701,10 @@ async function detectLoop() {
   const t0 = performance.now();
 
   const inputTensor = preprocess(video);
+  const tPreprocess = performance.now();
+
   const output = await session.run({ input: inputTensor });
+  const tInference = performance.now();
 
   const detsData = output.dets.data;
   const labelsData = output.labels.data;
@@ -662,20 +716,37 @@ async function detectLoop() {
   output.labels.dispose();
   if (output.masks) output.masks.dispose();
 
+  // Ensure overlay canvas matches video native resolution
   const vidW = video.videoWidth;
   const vidH = video.videoHeight;
+  if (overlay.width !== vidW || overlay.height !== vidH) {
+    syncOverlay();
+  }
 
   const detections = postprocess(detsData, labelsData, vidW, vidH);
-  drawDetections(detections, overlay.width, overlay.height, masksData, maskDims);
+  const tPostprocess = performance.now();
 
+  drawDetections(detections, vidW, vidH, masksData, maskDims);
+  const tDraw = performance.now();
+
+  let tSidebar = tDraw;
   frameCount++;
   if (showSegments && frameCount % 3 === 0) {
     updateSidebar(detections, masksData, maskDims, vidW, vidH);
+    tSidebar = performance.now();
   }
 
-  const elapsed = performance.now() - t0;
+  const elapsed = tSidebar - t0;
   const mode = hasSegmentation ? "seg" : "det";
-  statsEl.textContent = `${elapsed.toFixed(0)}ms | ${(1000 / elapsed).toFixed(1)} FPS | ${detections.length} objects | ${mode}`;
+  statsEl.textContent = [
+    `${elapsed.toFixed(0)}ms ${(1000 / elapsed).toFixed(0)}fps`,
+    `pre:${(tPreprocess - t0).toFixed(0)}`,
+    `inf:${(tInference - tPreprocess).toFixed(0)}`,
+    `post:${(tPostprocess - tInference).toFixed(0)}`,
+    `draw:${(tDraw - tPostprocess).toFixed(0)}`,
+    showSegments ? `side:${(tSidebar - tDraw).toFixed(0)}` : "",
+    `${detections.length}obj ${mode}`,
+  ].filter(Boolean).join(" | ");
 
   requestAnimationFrame(detectLoop);
 }

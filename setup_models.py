@@ -20,7 +20,7 @@ VENV_DIR = ROOT / "venv"
 REQUIREMENTS = ROOT / "requirements.txt"
 
 IS_WIN = sys.platform == "win32"
-VENV_PYTHON = VENV_DIR / ("Scripts" / "python.exe" if IS_WIN else "bin" / "python")
+VENV_PYTHON = VENV_DIR / "Scripts" / "python.exe" if IS_WIN else VENV_DIR / "bin" / "python"
 
 
 def ensure_venv():

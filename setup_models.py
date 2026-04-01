@@ -1,21 +1,70 @@
 #!/usr/bin/env python3
 """Download and export RF-DETR ONNX models for the web app.
 
+Automatically creates a Python venv and installs dependencies if needed.
+
 Usage:
-    python setup_models.py              # export default models (all in manifest)
+    python setup_models.py              # export all models in manifest
     python setup_models.py nano small   # export specific models only
 """
 import json
+import subprocess
 import sys
 import os
 from pathlib import Path
 
-MODELS_DIR = Path(__file__).parent / "web" / "public" / "models"
+ROOT = Path(__file__).parent
+MODELS_DIR = ROOT / "web" / "public" / "models"
 MANIFEST = MODELS_DIR / "manifest.json"
+VENV_DIR = ROOT / "venv"
+REQUIREMENTS = ROOT / "requirements.txt"
+
+IS_WIN = sys.platform == "win32"
+VENV_PYTHON = VENV_DIR / ("Scripts" / "python.exe" if IS_WIN else "bin" / "python")
+
+
+def ensure_venv():
+    """Create venv and install deps if not already set up."""
+    if VENV_PYTHON.exists():
+        # Check if rfdetr is installed
+        result = subprocess.run(
+            [str(VENV_PYTHON), "-c", "import rfdetr"],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return  # venv exists and has rfdetr
+
+    if not VENV_PYTHON.exists():
+        print("Creating Python venv...")
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+
+    print("Installing Python dependencies (torch, rfdetr, etc.)...")
+    print("This may take a few minutes on first run.\n")
+    pip = VENV_DIR / ("Scripts" / "pip.exe" if IS_WIN else "bin" / "pip")
+    subprocess.check_call([str(pip), "install", "-r", str(REQUIREMENTS)])
+
+
+def run_in_venv():
+    """Re-exec this script inside the venv if we're not already in it."""
+    # If rfdetr imports fine, we're good
+    try:
+        import rfdetr  # noqa: F401
+        return False  # no re-exec needed
+    except ImportError:
+        pass
+
+    # Re-run this script with the venv python
+    args = [str(VENV_PYTHON), __file__] + sys.argv[1:]
+    result = subprocess.run(args)
+    sys.exit(result.returncode)
+
+
+def models_from_manifest():
+    with open(MANIFEST) as f:
+        return [m["id"] for m in json.load(f)]
 
 
 def get_model_class(model_id):
-    """Lazy-import rfdetr and return (ModelClass, resolution) for a model id."""
     from rfdetr import (
         RFDETRNano, RFDETRSmall, RFDETRMedium, RFDETRLarge, RFDETRBase,
     )
@@ -43,19 +92,13 @@ def get_model_class(model_id):
     return REGISTRY[model_id]
 
 
-def models_from_manifest():
-    """Read model IDs from the web manifest."""
-    with open(MANIFEST) as f:
-        return [m["id"] for m in json.load(f)]
-
-
 def main():
-    if sys.argv[1:]:
-        model_ids = sys.argv[1:]
-    else:
-        model_ids = models_from_manifest()
+    ensure_venv()
+    run_in_venv()
 
-    # Check which models already exist
+    # If we get here, rfdetr is available
+    model_ids = sys.argv[1:] if sys.argv[1:] else models_from_manifest()
+
     missing = []
     for mid in model_ids:
         onnx_path = MODELS_DIR / mid / "inference_model.onnx"

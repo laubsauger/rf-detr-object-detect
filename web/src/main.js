@@ -127,6 +127,22 @@ function getSegmentEl(index) {
   return el;
 }
 
+// --- Validation ---
+
+function validateOnnx(buf, url) {
+  if (buf.byteLength < 16) {
+    throw new Error(`Model file too small (${buf.byteLength} bytes) — likely missing: ${url}`);
+  }
+  // ONNX protobuf starts with field tag 0x08; HTML starts with 0x3C (<)
+  const first = new Uint8Array(buf, 0, 4);
+  if (first[0] === 0x3C) {
+    throw new Error(
+      `Model file not found at ${url} (got HTML instead of ONNX). ` +
+      `Run export_onnx.py to generate models, or copy them to web/public/models/.`
+    );
+  }
+}
+
 // --- Progress bar ---
 
 function showProgress(pct) {
@@ -144,12 +160,22 @@ async function fetchModelWithProgress(url) {
 
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
+
+  const contentType = response.headers.get("Content-Type") || "";
+  if (contentType.includes("text/html")) {
+    throw new Error(
+      `Model file not found at ${url} (server returned HTML). ` +
+      `Run export_onnx.py on a machine with PyTorch to generate the .onnx files.`
+    );
+  }
+
   const contentLength = response.headers.get("Content-Length");
   const total = contentLength ? parseInt(contentLength, 10) : 0;
 
   if (!response.body || !total) {
     // No streaming support or unknown size — just download
     const buf = await response.arrayBuffer();
+    validateOnnx(buf, url);
     modelCache.set(url, buf);
     return buf;
   }
@@ -174,6 +200,7 @@ async function fetchModelWithProgress(url) {
     offset += chunk.length;
   }
 
+  validateOnnx(buf, url);
   modelCache.set(url, buf);
   return buf;
 }
@@ -265,7 +292,10 @@ async function loadModel(modelId) {
     modelData = await fetchModelWithProgress(modelUrl);
     hideProgress();
   } catch (e) {
-    statusEl.childNodes[0].textContent = `Download failed: ${e.message}`;
+    console.error("Model download error:", e);
+    statusEl.childNodes[0].textContent = e.message.includes("not found")
+      ? `Model not found — run export_onnx.py or copy .onnx files to web/public/models/`
+      : `Download failed: ${e.message}`;
     hideProgress();
     loading = false;
     modelSelect.disabled = false;

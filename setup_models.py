@@ -40,7 +40,7 @@ def ensure_venv():
 
     print("Installing Python dependencies (torch, rfdetr, etc.)...")
     print("This may take a few minutes on first run.\n")
-    pip = VENV_DIR / ("Scripts" / "pip.exe" if IS_WIN else "bin" / "pip")
+    pip = VENV_DIR / "Scripts" / "pip.exe" if IS_WIN else VENV_DIR / "bin" / "pip"
     subprocess.check_call([str(pip), "install", "-r", str(REQUIREMENTS)])
 
 

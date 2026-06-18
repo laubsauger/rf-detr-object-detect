@@ -53,6 +53,27 @@ function hslToRgba(hslStr, alpha) {
 }
 const COLOR_RGBA = COLORS.map(c => hslToRgba(c, 100));
 
+// YOLO26 uses contiguous 80-class COCO indexing (0-79), unlike RF-DETR's
+// 91 category-id scheme above. Separate name + colour tables per family.
+const YOLO_CLASSES = [
+  "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+  "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+  "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+  "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+  "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+  "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+  "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair",
+  "couch","potted plant","bed","dining table","toilet","tv","laptop","mouse",
+  "remote","keyboard","cell phone","microwave","oven","toaster","sink",
+  "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
+  "toothbrush",
+];
+const YOLO_COLORS = YOLO_CLASSES.map((_, i) => `hsl(${(i * 37) % 360}, 70%, 55%)`);
+
+// Active lookup tables — swapped on model load based on family.
+let activeNames = COCO_CLASSES;
+let activeColors = COLORS;
+
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 
@@ -91,6 +112,8 @@ let running = false;
 let threshold = 0.5;
 let activeBackend = null;
 let hasSegmentation = false;
+let family = "rfdetr";      // "rfdetr" | "yolo"
+let inputName = "input";    // ONNX graph input name (rfdetr:"input", yolo:"images")
 let inputSize = 384;
 let loading = false;
 let manifest = [];
@@ -275,6 +298,10 @@ async function loadModel(modelId) {
 
   const meta = manifest.find(m => m.id === modelId);
   inputSize = meta.resolution;
+  family = meta.family || "rfdetr";
+  inputName = family === "yolo" ? "images" : "input";
+  activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
+  activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
 
   const modelUrl = `/models/${modelId}/inference_model.onnx`;
   const preferredBackend = backendSelect.value;
@@ -325,7 +352,7 @@ async function loadModel(modelId) {
     return;
   }
 
-  hasSegmentation = session.outputNames.includes("masks");
+  hasSegmentation = meta.task === "seg";
 
   inputBuf = new Float32Array(1 * 3 * inputSize * inputSize);
   prepCanvas = new OffscreenCanvas(inputSize, inputSize);
@@ -361,13 +388,21 @@ function preprocess(videoEl) {
   const imgData = prepCtx.getImageData(0, 0, inputSize, inputSize).data;
 
   const hw = inputSize * inputSize;
+  // RF-DETR expects ImageNet mean/std; YOLO26 expects plain 0-1. Both NCHW RGB.
+  const yolo = family === "yolo";
   for (let i = 0; i < hw; i++) {
     const r = imgData[i * 4] / 255;
     const g = imgData[i * 4 + 1] / 255;
     const b = imgData[i * 4 + 2] / 255;
-    inputBuf[i] = (r - MEAN[0]) / STD[0];
-    inputBuf[hw + i] = (g - MEAN[1]) / STD[1];
-    inputBuf[2 * hw + i] = (b - MEAN[2]) / STD[2];
+    if (yolo) {
+      inputBuf[i] = r;
+      inputBuf[hw + i] = g;
+      inputBuf[2 * hw + i] = b;
+    } else {
+      inputBuf[i] = (r - MEAN[0]) / STD[0];
+      inputBuf[hw + i] = (g - MEAN[1]) / STD[1];
+      inputBuf[2 * hw + i] = (b - MEAN[2]) / STD[2];
+    }
   }
   return new ort.Tensor("float32", inputBuf, [1, 3, inputSize, inputSize]);
 }
@@ -408,6 +443,79 @@ function postprocess(dets, labels, vidW, vidH) {
   }
 
   return results;
+}
+
+// YOLO26 ONNX is NMS-free / end-to-end: output0 = [1, 300, 6] (det) or
+// [1, 300, 38] (seg) where each row is [x1,y1,x2,y2,conf,cls, ...32 coeffs].
+// Coords are pixels in the (stretched) inputSize square. We mirror x to match
+// the CSS-flipped video, exactly like the RF-DETR path.
+function postprocessYolo(data, stride, vidW, vidH) {
+  const nrows = data.length / stride;
+  const results = [];
+  for (let q = 0; q < nrows; q++) {
+    const o = q * stride;
+    const score = data[o + 4];
+    if (score < threshold) continue;  // rows are score-sorted; could break, but cheap
+
+    const nx1 = data[o] / inputSize;
+    const ny1 = data[o + 1] / inputSize;
+    const nx2 = data[o + 2] / inputSize;
+    const ny2 = data[o + 3] / inputSize;
+
+    results.push({
+      x1: (1 - nx2) * vidW,   // mirror: left/right swap
+      y1: ny1 * vidH,
+      x2: (1 - nx1) * vidW,
+      y2: ny2 * vidH,
+      score,
+      classId: Math.round(data[o + 5]),
+      queryIdx: results.length,  // index into the compacted mask buffer below
+      row: q,
+      // original (un-mirrored) normalized box — mask grid is mirrored at draw time
+      _nx1: nx1, _ny1: ny1, _nx2: nx2, _ny2: ny2,
+    });
+  }
+  return results;
+}
+
+// Build an RF-DETR-shaped mask buffer from YOLO seg outputs so the existing
+// drawMasks / updateSidebar code works unchanged. masksData is [n, mh, mw]
+// indexed by det.queryIdx; value > 0 means inside the mask.
+//   output0 row tail (offset 6..37) = 32 mask coefficients
+//   proto = output1 [1, 32, mh, mw];  mask = coeffs · proto, cropped to the box
+function buildYoloMasks(detections, output0, stride, proto, protoDims) {
+  const nMask = protoDims[1];        // 32
+  const mh = protoDims[2];
+  const mw = protoDims[3];
+  const maskSize = mh * mw;
+  const n = detections.length;
+  const masksData = new Float32Array(n * maskSize);
+  masksData.fill(-1);                // -1 => outside (drawMasks treats > 0 as in-mask)
+
+  for (let j = 0; j < n; j++) {
+    const det = detections[j];
+    const coefBase = det.row * stride + 6;
+
+    // Box in proto grid coords (proto spans the inputSize square).
+    const bx1 = Math.max(0, Math.floor((det._nx1) * mw));
+    const bx2 = Math.min(mw, Math.ceil((det._nx2) * mw));
+    const by1 = Math.max(0, Math.floor((det._ny1) * mh));
+    const by2 = Math.min(mh, Math.ceil((det._ny2) * mh));
+
+    const out = j * maskSize;
+    for (let y = by1; y < by2; y++) {
+      for (let x = bx1; x < bx2; x++) {
+        const p = y * mw + x;
+        let acc = 0;
+        for (let c = 0; c < nMask; c++) {
+          acc += output0[coefBase + c] * proto[c * maskSize + p];
+        }
+        // sigmoid > 0.5  <=>  logit > 0; store logit, drawMasks checks > 0.
+        masksData[out + p] = acc;
+      }
+    }
+  }
+  return { masksData, maskDims: [1, n, mh, mw] };
 }
 
 // --- Drawing ---
@@ -546,7 +654,7 @@ function drawMasks(detections, masksData, maskDims, vidW, vidH) {
       // Fill
       if (maskOpacity > 0) {
         ctx.globalAlpha = maskOpacity;
-        ctx.fillStyle = COLORS[det.classId];
+        ctx.fillStyle = activeColors[det.classId];
         ctx.fill();
       }
 
@@ -572,8 +680,8 @@ function drawDetections(detections, w, h, masksData, maskDims) {
   }
 
   for (const det of detections) {
-    const color = COLORS[det.classId];
-    const label = `${COCO_CLASSES[det.classId]} ${det.score.toFixed(2)}`;
+    const color = activeColors[det.classId];
+    const label = `${activeNames[det.classId]} ${det.score.toFixed(2)}`;
     const bx = det.x1;
     const by = det.y1;
     const bw = det.x2 - det.x1;
@@ -688,8 +796,8 @@ function updateSidebar(detections, masksData, maskDims, vidW, vidH) {
     cctx.putImageData(imgData, 0, 0);
 
     const areaPercent = ((det.maskArea / maskSize) * 100).toFixed(1);
-    label.textContent = `${COCO_CLASSES[det.classId]} ${det.score.toFixed(2)} (${areaPercent}%)`;
-    label.style.color = COLORS[det.classId];
+    label.textContent = `${activeNames[det.classId]} ${det.score.toFixed(2)} (${areaPercent}%)`;
+    label.style.color = activeColors[det.classId];
 
     el.style.display = "";
     if (!el.parentNode) segmentGrid.appendChild(el);
@@ -734,18 +842,9 @@ async function detectLoop() {
   const inputTensor = preprocess(video);
   const tPreprocess = performance.now();
 
-  const output = await session.run({ input: inputTensor });
+  const output = await session.run({ [inputName]: inputTensor });
   const tInference = performance.now();
-
-  const detsData = output.dets.data;
-  const labelsData = output.labels.data;
-  const masksData = hasSegmentation ? output.masks.data : null;
-  const maskDims = hasSegmentation ? output.masks.dims : null;
-
   inputTensor.dispose();
-  output.dets.dispose();
-  output.labels.dispose();
-  if (output.masks) output.masks.dispose();
 
   // Ensure overlay canvas matches video native resolution
   const vidW = video.videoWidth;
@@ -754,7 +853,26 @@ async function detectLoop() {
     syncOverlay();
   }
 
-  const detections = postprocess(detsData, labelsData, vidW, vidH);
+  let detections, masksData = null, maskDims = null;
+  if (family === "yolo") {
+    const out0 = output.output0;
+    const stride = out0.dims[2];               // 6 (det) or 38 (seg)
+    detections = postprocessYolo(out0.data, stride, vidW, vidH);
+    if (hasSegmentation && detections.length) {
+      const proto = output.output1;
+      const built = buildYoloMasks(detections, out0.data, stride, proto.data, proto.dims);
+      masksData = built.masksData;
+      maskDims = built.maskDims;
+    }
+    for (const k in output) output[k].dispose();
+  } else {
+    detections = postprocess(output.dets.data, output.labels.data, vidW, vidH);
+    masksData = hasSegmentation ? output.masks.data : null;
+    maskDims = hasSegmentation ? output.masks.dims : null;
+    output.dets.dispose();
+    output.labels.dispose();
+    if (output.masks) output.masks.dispose();
+  }
   const tPostprocess = performance.now();
 
   drawDetections(detections, vidW, vidH, masksData, maskDims);
@@ -767,19 +885,50 @@ async function detectLoop() {
     tSidebar = performance.now();
   }
 
-  const elapsed = tSidebar - t0;
   const mode = hasSegmentation ? "seg" : "det";
+  // Rolling median per stage (n=60) — same as the python cam HUD, so the two
+  // are directly comparable instead of reading jittery instantaneous values.
+  pushStat({
+    pre: tPreprocess - t0,
+    inf: tInference - tPreprocess,
+    post: tPostprocess - tInference,
+    draw: tDraw - tPostprocess,
+    total: tSidebar - t0,
+  });
+  const m = medianStats();
   statsEl.textContent = [
-    `${elapsed.toFixed(0)}ms ${(1000 / elapsed).toFixed(0)}fps`,
-    `pre:${(tPreprocess - t0).toFixed(0)}`,
-    `inf:${(tInference - tPreprocess).toFixed(0)}`,
-    `post:${(tPostprocess - tInference).toFixed(0)}`,
-    `draw:${(tDraw - tPostprocess).toFixed(0)}`,
-    showSegments ? `side:${(tSidebar - tDraw).toFixed(0)}` : "",
-    `${detections.length}obj ${mode}`,
-  ].filter(Boolean).join(" | ");
+    `pre:${m.pre.toFixed(1)}`,
+    `inf:${m.inf.toFixed(1)} (${(1000 / m.inf).toFixed(0)}fps)`,
+    `post:${m.post.toFixed(1)}`,
+    `draw:${m.draw.toFixed(1)}`,
+    `total:${m.total.toFixed(1)}ms (${(1000 / m.total).toFixed(0)}fps)`,
+    `${detections.length}obj ${mode} ${inputSize}px ${family}`,
+  ].join(" | ");
 
   requestAnimationFrame(detectLoop);
+}
+
+// --- Rolling-median stats (matches python cam-detect HUD) ---
+const STAT_KEYS = ["pre", "inf", "post", "draw", "total"];
+let statHist = [];
+let statModelId = null;
+
+function pushStat(s) {
+  if (statModelId !== currentModelId) {  // reset window on model switch
+    statHist = [];
+    statModelId = currentModelId;
+  }
+  statHist.push(s);
+  if (statHist.length > 60) statHist.shift();
+}
+
+function medianStats() {
+  const out = {};
+  for (const k of STAT_KEYS) {
+    const vals = statHist.map(s => s[k]).sort((a, b) => a - b);
+    out[k] = vals.length ? vals[vals.length >> 1] : 0;
+  }
+  return out;
 }
 
 // --- Camera start/stop ---

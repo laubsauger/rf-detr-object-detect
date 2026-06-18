@@ -64,32 +64,59 @@ def models_from_manifest():
         return [m["id"] for m in json.load(f)]
 
 
-def get_model_class(model_id):
-    from rfdetr import (
-        RFDETRNano, RFDETRSmall, RFDETRMedium, RFDETRLarge, RFDETRBase,
-    )
-    from rfdetr import (
-        RFDETRSegNano, RFDETRSegSmall, RFDETRSegMedium, RFDETRSegLarge,
-    )
+# Family + resolution per id. RF-DETR ids map to rfdetr classes; YOLO26 ids
+# map to ultralytics weights. Web decode keys off `family` in manifest.json.
+SPECS = {
+    "nano":         dict(family="rfdetr", rf="RFDETRNano",      resolution=384),
+    "small":        dict(family="rfdetr", rf="RFDETRSmall",     resolution=512),
+    "medium":       dict(family="rfdetr", rf="RFDETRMedium",    resolution=576),
+    "large":        dict(family="rfdetr", rf="RFDETRLarge",     resolution=704),
+    "base":         dict(family="rfdetr", rf="RFDETRBase",      resolution=560),
+    "seg-nano":     dict(family="rfdetr", rf="RFDETRSegNano",   resolution=312),
+    "seg-small":    dict(family="rfdetr", rf="RFDETRSegSmall",  resolution=384),
+    "seg-medium":   dict(family="rfdetr", rf="RFDETRSegMedium", resolution=432),
+    "seg-large":    dict(family="rfdetr", rf="RFDETRSegLarge",  resolution=504),
+    "yolo26n":      dict(family="yolo", weights="yolo26n.pt",     resolution=640),
+    "yolo26s":      dict(family="yolo", weights="yolo26s.pt",     resolution=640),
+    "yolo26n-seg":  dict(family="yolo", weights="yolo26n-seg.pt", resolution=640),
+    "yolo26s-seg":  dict(family="yolo", weights="yolo26s-seg.pt", resolution=640),
+}
 
-    REGISTRY = {
-        "nano":       (RFDETRNano,      384),
-        "small":      (RFDETRSmall,     512),
-        "medium":     (RFDETRMedium,    576),
-        "large":      (RFDETRLarge,     704),
-        "base":       (RFDETRBase,      560),
-        "seg-nano":   (RFDETRSegNano,   312),
-        "seg-small":  (RFDETRSegSmall,  384),
-        "seg-medium": (RFDETRSegMedium, 432),
-        "seg-large":  (RFDETRSegLarge,  504),
-    }
 
-    if model_id not in REGISTRY:
+def get_spec(model_id):
+    if model_id not in SPECS:
         print(f"Unknown model: {model_id}")
-        print(f"Available: {', '.join(REGISTRY.keys())}")
+        print(f"Available: {', '.join(SPECS)}")
         sys.exit(1)
+    return SPECS[model_id]
 
-    return REGISTRY[model_id]
+
+def export_rfdetr(spec, output_dir):
+    import rfdetr
+
+    cls = getattr(rfdetr, spec["rf"])
+    res = spec["resolution"]
+    print(f"  RF-DETR {spec['rf']} at {res}x{res}...")
+    model = cls()
+    model.export(
+        output_dir=output_dir,
+        shape=(res, res),
+        batch_size=1,
+        opset_version=17,
+        verbose=True,
+    )
+
+
+def export_yolo(spec, output_dir):
+    import shutil
+    from ultralytics import YOLO
+
+    res = spec["resolution"]
+    print(f"  YOLO26 {spec['weights']} at {res}x{res}...")
+    model = YOLO(spec["weights"])
+    onnx_path = model.export(format="onnx", imgsz=res, opset=17, verbose=False)
+    # Ultralytics writes <weights>.onnx next to the weights; normalise the name.
+    shutil.move(str(onnx_path), os.path.join(output_dir, "inference_model.onnx"))
 
 
 def main():
@@ -116,19 +143,15 @@ def main():
     print("This will download PyTorch weights and convert to ONNX.\n")
 
     for mid in missing:
-        cls, resolution = get_model_class(mid)
+        spec = get_spec(mid)
         output_dir = str(MODELS_DIR / mid)
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"Exporting {mid} ({cls.__name__}) at {resolution}x{resolution}...")
-        model = cls()
-        model.export(
-            output_dir=output_dir,
-            shape=(resolution, resolution),
-            batch_size=1,
-            opset_version=17,
-            verbose=True,
-        )
+        print(f"Exporting {mid} ({spec['family']})...")
+        if spec["family"] == "rfdetr":
+            export_rfdetr(spec, output_dir)
+        else:
+            export_yolo(spec, output_dir)
         print(f"  -> {output_dir}/inference_model.onnx\n")
 
     print("Done. All models exported.")

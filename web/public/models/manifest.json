@@ -1,10 +1,14 @@
 [
-  { "id": "seg-nano", "label": "Seg Nano", "resolution": 312 },
-  { "id": "seg-small", "label": "Seg Small", "resolution": 384 },
-  { "id": "seg-medium", "label": "Seg Medium", "resolution": 432 },
-  { "id": "seg-large", "label": "Seg Large", "resolution": 504 },
-  { "id": "nano", "label": "Det Nano", "resolution": 384 },
-  { "id": "small", "label": "Det Small", "resolution": 512 },
-  { "id": "medium", "label": "Det Medium", "resolution": 576 },
-  { "id": "large", "label": "Det Large", "resolution": 704 }
+  { "id": "seg-nano", "label": "RF-DETR Seg Nano", "resolution": 312, "family": "rfdetr", "task": "seg" },
+  { "id": "seg-small", "label": "RF-DETR Seg Small", "resolution": 384, "family": "rfdetr", "task": "seg" },
+  { "id": "seg-medium", "label": "RF-DETR Seg Medium", "resolution": 432, "family": "rfdetr", "task": "seg" },
+  { "id": "seg-large", "label": "RF-DETR Seg Large", "resolution": 504, "family": "rfdetr", "task": "seg" },
+  { "id": "nano", "label": "RF-DETR Det Nano", "resolution": 384, "family": "rfdetr", "task": "det" },
+  { "id": "small", "label": "RF-DETR Det Small", "resolution": 512, "family": "rfdetr", "task": "det" },
+  { "id": "medium", "label": "RF-DETR Det Medium", "resolution": 576, "family": "rfdetr", "task": "det" },
+  { "id": "large", "label": "RF-DETR Det Large", "resolution": 704, "family": "rfdetr", "task": "det" },
+  { "id": "yolo26n-seg", "label": "YOLO26 Seg Nano", "resolution": 640, "family": "yolo", "task": "seg" },
+  { "id": "yolo26s-seg", "label": "YOLO26 Seg Small", "resolution": 640, "family": "yolo", "task": "seg" },
+  { "id": "yolo26n", "label": "YOLO26 Det Nano", "resolution": 640, "family": "yolo", "task": "det" },
+  { "id": "yolo26s", "label": "YOLO26 Det Small", "resolution": 640, "family": "yolo", "task": "det" }
 ]

@@ -1,4 +1,5 @@
 rfdetr>=1.6.2
+ultralytics>=8.4.71
 supervision>=0.27.0
 opencv-python>=4.13.0
 torch>=2.11.0

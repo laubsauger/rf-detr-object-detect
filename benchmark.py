@@ -1,29 +1,48 @@
+"""Benchmark any model in the zoo on its real backend.
+
+    python benchmark.py                  # default 3-way seg: RF-DETR vs YOLO26(torch) vs YOLO26(MLX)
+    python benchmark.py yolo26n yolo26n-mlx       # any ids
+
+Three backends are comparable head-to-head:
+    *-seg / nano / ...   RF-DETR + YOLO26 via PyTorch on MPS (or CUDA/CPU)
+    *-mlx                YOLO26 native on MLX (Apple Silicon Metal, no torch)
+
+Times end-to-end predict() with warmup. For RF-DETR ids it also times the
+exported ONNX across available ORT providers.
+"""
 import sys
 import time
+
 import numpy as np
 
-MODELS = {
-    "nano": (384, "rf-detr-nano"),
-    "seg-nano": (312, "rf-detr-seg-nano"),
-}
+import models
 
-model_name = sys.argv[1] if len(sys.argv) > 1 else "nano"
-if model_name not in MODELS:
-    print(f"Unknown model: {model_name}. Available: {', '.join(MODELS.keys())}")
-    sys.exit(1)
-
-resolution, _ = MODELS[model_name]
 ITERS = 50
 WARMUP = 5
 
-dummy_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+ids = sys.argv[1:] or ["seg-nano", "yolo26n-seg", "yolo26n-seg-mlx"]
+for mid in ids:
+    if mid not in models.REGISTRY:
+        print(f"Unknown model: {mid}. Available: {', '.join(models.REGISTRY)}")
+        sys.exit(1)
+
+import cv2
+from ultralytics.utils import ASSETS
+
+# Real image with objects — random noise finds 0 detections, which skips all
+# mask/NMS postprocess and undercounts. Resized square to each model's native res.
+_BASE = cv2.imread(str(ASSETS / "bus.jpg"))
+
+
+def native_input(res):
+    return cv2.resize(_BASE, (res, res))
 
 
 def print_stats(label, times):
-    print(f"  {label:<20s} median {np.median(times):6.1f}ms | mean {np.mean(times):6.1f}ms | min {np.min(times):6.1f}ms | max {np.max(times):6.1f}ms")
+    print(f"  {label:<22s} median {np.median(times):6.1f}ms | mean {np.mean(times):6.1f}ms | min {np.min(times):6.1f}ms | max {np.max(times):6.1f}ms")
 
 
-def bench_section(label, fn):
+def bench(label, fn):
     for _ in range(WARMUP):
         fn()
     times = []
@@ -34,93 +53,53 @@ def bench_section(label, fn):
     print_stats(label, times)
 
 
-# ============================================================
-# 1. PyTorch benchmark
-# ============================================================
-print(f"=== RF-DETR {model_name} Benchmark ({resolution}x{resolution}, {ITERS} iterations) ===\n")
+print(f"=== Zoo benchmark | torch device: {models.DEVICE} | {WARMUP} warmup + {ITERS} iters ===\n")
 
-try:
-    import torch
+for mid in ids:
+    spec = models.REGISTRY[mid]
+    print(f"--- {mid}  ({spec['family']} {spec['task']} @ {spec['resolution']}px) ---")
 
-    if model_name == "nano":
-        from rfdetr import RFDETRNano as ModelClass
-    elif model_name == "seg-nano":
-        from rfdetr import RFDETRSegNano as ModelClass
+    # 1. End-to-end predict on the model's real backend (torch/MPS or MLX/Metal).
+    #    Fed at native resolution (res x res) so no resize cost skews the number.
+    dummy = native_input(spec["resolution"])
+    try:
+        model = models.build(mid)
+        bench(f"predict [{model.backend}/{model.device}]", lambda: model.predict(dummy, threshold=0.5))
+        sp = model.last_speed
+        if sp:
+            print(f"    split  pre {sp['preprocess']:4.1f} | inf {sp['inference']:5.1f} | post {sp['postprocess']:5.1f} ms (ultralytics profiler)")
+        else:
+            print("    split  not available for this backend (bundled)")
+    except Exception as e:
+        print(f"  predict skipped: {e}")
 
-    device = "CUDA" if torch.cuda.is_available() else "MPS" if torch.backends.mps.is_available() else "CPU"
-    print(f"[PyTorch] device: {device}")
+    # 2. ONNX Runtime — only RF-DETR ids have exported web models.
+    onnx_path = f"web/public/models/{mid}/inference_model.onnx"
+    try:
+        import onnxruntime as ort
+        import os
 
-    model = ModelClass()
-    bench_section("predict (unopt)", lambda: model.predict(dummy_img, threshold=0.5))
+        if not os.path.exists(onnx_path):
+            print(f"  ONNX skipped: {onnx_path} not found (run setup_models.py)")
+        else:
+            res = spec["resolution"]
+            input_np = np.random.randn(1, 3, res, res).astype(np.float32)
+            onnx_input = "images" if spec["family"] == "yolo" else "input"
+            available = ort.get_available_providers()
+            providers_to_try = []
+            if "CUDAExecutionProvider" in available:
+                providers_to_try.append(("CUDA", ["CUDAExecutionProvider"]))
+            if "CoreMLExecutionProvider" in available:
+                providers_to_try.append(("CoreML", ["CoreMLExecutionProvider"]))
+            providers_to_try.append(("CPU", ["CPUExecutionProvider"]))
 
-    model.optimize_for_inference()
-    bench_section("predict (opt)", lambda: model.predict(dummy_img, threshold=0.5))
-
-    # Raw forward pass
-    input_tensor = torch.randn(1, 3, resolution, resolution)
-    if torch.cuda.is_available():
-        input_tensor = input_tensor.cuda()
-        model.model.inference_model = model.model.inference_model.cuda()
-        sync = torch.cuda.synchronize
-    elif torch.backends.mps.is_available():
-        input_tensor = input_tensor.to("mps")
-        model.model.inference_model = model.model.inference_model.to("mps")
-        sync = torch.mps.synchronize
-    else:
-        sync = lambda: None
-
-    def forward_only():
-        with torch.no_grad():
-            model.model.inference_model(input_tensor)
-        sync()
-
-    bench_section("forward only", forward_only)
-    print()
-except Exception as e:
-    print(f"[PyTorch] skipped: {e}\n")
-
-# ============================================================
-# 2. ONNX Runtime benchmark
-# ============================================================
-try:
-    import onnxruntime as ort
-
-    onnx_path = f"web/public/models/{model_name}/inference_model.onnx"
-    input_np = np.random.randn(1, 3, resolution, resolution).astype(np.float32)
-
-    # Try all available providers
-    available = ort.get_available_providers()
-    providers_to_try = []
-
-    if "TensorrtExecutionProvider" in available:
-        providers_to_try.append(("TensorRT", ["TensorrtExecutionProvider", "CUDAExecutionProvider"]))
-    if "CUDAExecutionProvider" in available:
-        providers_to_try.append(("CUDA", ["CUDAExecutionProvider"]))
-    if "CoreMLExecutionProvider" in available:
-        providers_to_try.append(("CoreML", ["CoreMLExecutionProvider"]))
-    providers_to_try.append(("CPU", ["CPUExecutionProvider"]))
-
-    print(f"[ONNX Runtime] version: {ort.__version__}")
-    print(f"[ONNX Runtime] available providers: {', '.join(available)}")
-
-    for label, providers in providers_to_try:
-        try:
-            sess = ort.InferenceSession(onnx_path, providers=providers)
-            actual = sess.get_providers()
-            print(f"[ONNX Runtime] {label} (active: {', '.join(actual)})")
-
-            def run_onnx():
-                sess.run(None, {"input": input_np})
-
-            bench_section(f"ONNX {label}", run_onnx)
-        except Exception as e:
-            print(f"[ONNX Runtime] {label} failed: {e}")
+            for plabel, providers in providers_to_try:
+                try:
+                    sess = ort.InferenceSession(onnx_path, providers=providers)
+                    bench(f"onnx {plabel}", lambda s=sess: s.run(None, {onnx_input: input_np}))
+                except Exception as e:
+                    print(f"  onnx {plabel} failed: {e}")
+    except ImportError:
+        print("  ONNX skipped: onnxruntime not installed")
 
     print()
-except ImportError:
-    print("[ONNX Runtime] not installed (pip install onnxruntime or onnxruntime-gpu)\n")
-
-# ============================================================
-# Summary
-# ============================================================
-print(f"Model: {model_name} | Resolution: {resolution}x{resolution} | Iterations: {ITERS}")

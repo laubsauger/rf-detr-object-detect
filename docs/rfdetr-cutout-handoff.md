@@ -65,8 +65,4 @@ speed. The roundtrip/transport itself is <2 ms.
 - RF-DETR person class = **1** (COCO cat-id), not 0.
 - Mask is in un-mirrored model space; mirror it at draw time (video is CSS-flipped).
 - Don't materialize full-res masks per frame — union first, ship at 160².
-- **Latency sync (critical):** the mask is for a frame from ~inference-ms ago.
-  Do NOT composite it against the *live* video — snapshot the frame at send time
-  (`snapshotFrame` in `main.js`) and composite mask × snapshot. Hide the live
-  `<video>`. Result lags real-time by inference latency but stays aligned;
-  compositing live video makes the mask trail a moving person.
+- **Latency sync:** composite against the snapshot frame, not live video (see above).

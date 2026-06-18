@@ -38,6 +38,8 @@
     #backend-badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 0.65rem; font-weight: 600; margin-left: 3px; vertical-align: middle; }
     #backend-badge.webgpu { background: #2a7d2a; color: #fff; }
     #backend-badge.wasm { background: #b8860b; color: #fff; }
+    #backend-badge.python-mps { background: #4b6cb7; color: #fff; }
+    #backend-badge.python-mlx { background: #8e44ad; color: #fff; }
 
     /* Placeholder */
     #video-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; background: #0a0a0a; z-index: 3; }
@@ -88,6 +90,8 @@
           <option value="auto">Auto (WebGPU &gt; WASM)</option>
           <option value="webgpu">WebGPU</option>
           <option value="wasm">WASM</option>
+          <option value="python-mps">Python · torch/MPS</option>
+          <option value="python-mlx">Python · MLX</option>
         </select></label>
         <button id="startBtn" disabled>Start Camera</button>
 
@@ -98,6 +102,7 @@
         </div>
 
         <div class="ctrl-group">
+          <label><input type="checkbox" id="cutoutMode"> Cutout (person only, no UI)</label>
           <label><input type="checkbox" id="showSegments"> Show segment sidebar</label>
           <button id="fullscreenBtn">Fullscreen</button>
         </div>

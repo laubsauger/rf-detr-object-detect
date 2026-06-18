@@ -6,6 +6,8 @@ over COCO classes. Two ways to run:
 1. **Python webcam** (`cam-detect.py`) — native OpenCV window, PyTorch inference
    on the active device (MPS on Mac / CUDA / CPU). Switch models live.
 2. **Web app** (`web/`) — browser, webcam, ONNX Runtime Web (WASM/WebGPU).
+3. **Web app + Python bridge** (`bridge.py`) — browser UI, native inference. The
+   web app can run any zoo model on MPS/MLX over a WebSocket (see below).
 
 Python 3.11, venv lives in `./venv`.
 
@@ -166,10 +168,104 @@ top-300 output).
 
 ---
 
+## 3. Python inference bridge
+
+Run native inference (MPS / MLX) behind the web UI — faster than in-browser ONNX
+on Apple Silicon. Python does inference only; the browser draws (cheap).
+
+```bash
+source venv/bin/activate
+python bridge.py                 # ws://0.0.0.0:8765
+
+# separate terminal
+cd web && npm run dev            # then pick a "Python ·" backend in the UI
+```
+
+In the web app's **Backend** dropdown choose `Python · torch/MPS` or
+`Python · MLX`. Vite proxies `wss://<host>/bridge` → the python ws (so no
+mixed-content block on the HTTPS page); `python-mlx` requires a `yolo26*` model.
+
+**Transport:** raw RGBA frame up (no codec — loopback is ~GB/s), normalized dets
++ proto-res (160²) masks down, one request in flight (backpressure). Same
+decoded shape as the ONNX path, so all draw code is shared. A WebRTC transport
+for a *remote* GPU box can drop into `web/src/bridge.js` reusing
+`decodeBridgeResult()`.
+
+> **Critical:** the server sets `compression=None`. Default permessage-deflate on
+> the ~128KB mask payloads adds ~45ms/frame — disabling it cut round-trip
+> 58ms → 11ms.
+
+**Measured round-trip (bus.jpg, M-series, median), instrumented end to end:**
+
+| backend | rtt | model fwd | decode+pack | transport |
+|---------|----:|----------:|------------:|----------:|
+| yolo26n-seg · torch/MPS | **12.5 ms** | 9.8 | ~1.5 | ~1 |
+| yolo26n-seg · MLX | 10.7 ms | bundled | — | ~1 |
+| yolo26n (det) · torch/MPS | 9.8 ms | 8.9 | ~0 | ~1 |
+| seg-nano (RF-DETR) · MPS | ~38 ms | model-bound | sv path | ~1 |
+
+The torch/YOLO path uses **`YOLOModel.predict_fast`**: forward through
+ultralytics' warmed `AutoBackend`, then decode masks at proto res (160²) on the
+CPU — exactly like the ONNX/web path. This skips ultralytics' full-res mask
+postprocess + `sv.Detections` conversion that previously cost ~10 ms
+(`20.5 → 12.5 ms`). Transport itself is <2 ms (parse + encode + wire); the
+websocket was never the bottleneck. RF-DETR stays on the sv path (model-bound,
+different arch). Both the web stats line and `bridge.py` payload expose the
+split (`rtt = model + decode + transport`).
+
+> Earlier debugging milestones baked into the code: `compression=None`
+> (permessage-deflate added ~45 ms on mask payloads), raw RGBA frames (no codec
+> on loopback), and `predict_fast` (skip full-res masks). End state: every YOLO
+> path is within ~3 ms of its raw inference floor.
+
+See [`docs/realtime-python-js-bridge.md`](docs/realtime-python-js-bridge.md) for
+the portable recipe (reusable in other projects).
+
+---
+
+## 4. Background removal (person matte)
+
+The "throw a frame in, get the person cut out" use case — person class only, no
+boxes / contours / sidebar, leanest pipeline.
+
+**Web:** toggle **Cutout (person only, no UI)** in the controls. Works on any
+backend (WebGPU / WASM / Python bridge); composites `video × person-mask` on the
+GPU (`drawImage` + `destination-in`) — no full-res per-pixel JS. The stats line
+shows fps per backend so you can compare directly.
+
+**Bridge matte mode (least back-and-forth):** when cutout is on with a Python
+backend, the web sends `{type:"matte"}` and the server returns a **single
+person-union mask** (~25 KB, 160²) instead of all per-instance masks (~128 KB) —
+no boxes, no per-instance. Latency on loopback is the same (inference-bound) but
+the payload is 5× smaller and **flat regardless of how many people** are in
+frame (`run_matte` / `encode_matte` in `bridge.py`).
+
+**Benchmark** the raw pipeline (inference → person-union mask → apply):
+
+```bash
+python bench_matte.py                       # default backends
+python bench_matte.py yolo26n-seg-mlx       # specific
+```
+
+| backend | person matte | infer | union+apply |
+|---------|------------:|------:|------------:|
+| yolo26n-seg · MLX | **114 fps** (8.8 ms) | 8.6 | 0.2 |
+| yolo26n-seg · torch/MPS | **88 fps** (11.3 ms) | 11.2 | 0.1 |
+| seg-nano (RF-DETR) · MPS | 24 fps (42 ms) | 41.8 | 0.1 |
+
+**The matte itself is ~free (~0.2 ms)** — it's 100% inference-bound. So for
+background removal: pick the fastest seg model, skip all UI. This is also why
+WebGPU ≈ Python-bridge for full-UI seg in the browser — the cost was the
+mask-drawing/contour UI, not inference. Strip the UI (this mode) and you're
+reading raw model speed.
+
+---
+
 ## Dependencies
 
 - **Python** (`requirements.txt`): rfdetr, ultralytics, supervision,
-  opencv-python, torch, torchvision, onnx, onnxruntime.
+  opencv-python, torch, torchvision, onnx, onnxruntime, websockets. Plus
+  optional `yolo-mlx` (Apple Silicon) for the MLX backend.
 - **Web** (`web/package.json`): onnxruntime-web, vite.
 
 ## Gotchas

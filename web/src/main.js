@@ -1,4 +1,5 @@
 import * as ort from "onnxruntime-web";
+import { createBridge, decodeBridgeResult } from "./bridge.js";
 
 ort.env.logLevel = "error";
 ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
@@ -94,6 +95,7 @@ const modelSelect = document.getElementById("modelSelect");
 const backendSelect = document.getElementById("backendSelect");
 const fullscreenBtn = document.getElementById("fullscreenBtn");
 const showSegmentsCheckbox = document.getElementById("showSegments");
+const cutoutCheckbox = document.getElementById("cutoutMode");
 const segmentPane = document.getElementById("segment-pane");
 const segmentGrid = document.getElementById("segment-grid");
 const progressBar = document.getElementById("progress-bar");
@@ -115,11 +117,14 @@ let hasSegmentation = false;
 let family = "rfdetr";      // "rfdetr" | "yolo"
 let inputName = "input";    // ONNX graph input name (rfdetr:"input", yolo:"images")
 let inputSize = 384;
+let bridge = null;          // python inference bridge (null = local ONNX)
+let usingBridge = false;
 let loading = false;
 let manifest = [];
 let currentModelId = null;
 let frameCount = 0;
 let showSegments = false;
+let cutoutMode = false;
 let maskOpacity = 0.4;
 let outlineOpacity = 0.85;
 
@@ -233,6 +238,7 @@ async function fetchModelWithProgress(url) {
 thresholdInput.addEventListener("input", () => {
   threshold = parseFloat(thresholdInput.value);
   threshValEl.textContent = threshold.toFixed(2);
+  if (bridge) bridge.setThreshold(threshold);
 });
 
 modelSelect.addEventListener("change", () => {
@@ -273,6 +279,15 @@ showSegmentsCheckbox.addEventListener("change", () => {
   deferredSyncOverlay();
 });
 
+cutoutCheckbox.addEventListener("change", () => {
+  cutoutMode = cutoutCheckbox.checked;
+  // Hide the live video so the transparent overlay shows person-on-black.
+  video.style.opacity = cutoutMode ? "0" : "1";
+  videoPane.style.background = cutoutMode ? "#000" : "";
+  // Bridge: switch to person-union-mask-only payload (least back-and-forth).
+  if (bridge) bridge.setMatte(cutoutMode);
+});
+
 fullscreenBtn.addEventListener("click", () => {
   if (document.fullscreenElement) {
     document.exitFullscreen();
@@ -303,8 +318,19 @@ async function loadModel(modelId) {
   activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
   activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
 
-  const modelUrl = `/models/${modelId}/inference_model.onnx`;
   const preferredBackend = backendSelect.value;
+
+  // --- Python bridge backend (native MPS / MLX over WebSocket) ---
+  if (preferredBackend.startsWith("python")) {
+    const ok = await loadBridgeModel(modelId, meta, preferredBackend);
+    loading = false;
+    modelSelect.disabled = false;
+    if (ok) { startBtn.disabled = false; startBtnLarge.disabled = false; }
+    return;
+  }
+  if (bridge) { bridge.close(); bridge = null; usingBridge = false; }
+
+  const modelUrl = `/models/${modelId}/inference_model.onnx`;
   const backends = preferredBackend === "auto"
     ? ["webgpu", "wasm"]
     : [preferredBackend];
@@ -366,6 +392,51 @@ async function loadModel(modelId) {
   startBtnLarge.disabled = false;
   modelSelect.disabled = false;
   loading = false;
+}
+
+async function loadBridgeModel(modelId, meta, backend) {
+  if (bridge) { bridge.close(); bridge = null; }
+  usingBridge = false;
+  session = null;
+
+  // python-mps serves the manifest id directly; python-mlx needs the -mlx zoo
+  // variant, which only exists for YOLO26.
+  let serverId = modelId;
+  if (backend === "python-mlx") {
+    if (!modelId.startsWith("yolo26")) {
+      statusEl.childNodes[0].textContent = "MLX backend supports YOLO26 models only — pick a yolo26* model.";
+      return false;
+    }
+    serverId = `${modelId}-mlx`;
+  }
+
+  try {
+    statusEl.childNodes[0].textContent = `Connecting to Python bridge (${serverId})...`;
+    bridge = createBridge();
+    const m = await bridge.connect(serverId, threshold);
+    if (cutoutMode) bridge.setMatte(true);
+    family = m.family;
+    activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
+    activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
+    hasSegmentation = m.task === "seg";
+    usingBridge = true;
+    activeBackend = backend;
+
+    prepCanvas = new OffscreenCanvas(inputSize, inputSize);
+    prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
+
+    badgeEl.textContent = backend === "python-mlx" ? "PY·MLX" : "PY·MPS";
+    badgeEl.className = backend;
+    const modelType = hasSegmentation ? "Seg" : "Det";
+    statusEl.childNodes[0].textContent = `${meta.label} (${m.backend}/${m.device}, ${modelType}) `;
+    return true;
+  } catch (e) {
+    console.error("bridge load error:", e);
+    statusEl.childNodes[0].textContent = e.message;
+    bridge = null;
+    usingBridge = false;
+    return false;
+  }
 }
 
 async function loadManifest() {
@@ -672,6 +743,44 @@ function drawMasks(detections, masksData, maskDims, vidW, vidH) {
   ctx.globalAlpha = 1;
 }
 
+// Person-only background removal. Builds a person-union alpha at proto res
+// (cheap), then composites video × mask on the GPU (drawImage + destination-in)
+// — no full-res per-pixel JS, no boxes/contours/sidebar.
+let cutMask = null, cutMaskCtx = null;
+function drawCutout(detections, masksData, maskDims, w, h) {
+  ctx.clearRect(0, 0, w, h);
+  if (!masksData || !maskDims) return;
+  const mh = maskDims[2], mw = maskDims[3], maskSize = mh * mw;
+  const personId = family === "yolo" ? 0 : 1;   // YOLO 0 / RF-DETR COCO cat-id 1
+
+  if (!cutMask || cutMask.width !== mw || cutMask.height !== mh) {
+    cutMask = new OffscreenCanvas(mw, mh);
+    cutMaskCtx = cutMask.getContext("2d");
+  }
+  const img = cutMaskCtx.createImageData(mw, mh);
+  const a = img.data;
+  let any = false;
+  for (const det of detections) {
+    if (det.classId !== personId) continue;
+    const off = det.queryIdx * maskSize;
+    for (let i = 0; i < maskSize; i++) {
+      if (masksData[off + i] > 0) { a[i * 4 + 3] = 255; any = true; }
+    }
+  }
+  if (!any) return;
+  cutMaskCtx.putImageData(img, 0, 0);
+
+  // video drawn mirrored (CSS-flipped feed); mask is un-mirrored model space, so
+  // mirror it too when used as the alpha.
+  ctx.save();
+  ctx.translate(w, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, w, h);
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.drawImage(cutMask, 0, 0, w, h);   // GPU upscale 160² -> w×h
+  ctx.restore();
+  ctx.globalCompositeOperation = "source-over";
+}
+
 function drawDetections(detections, w, h, masksData, maskDims) {
   ctx.clearRect(0, 0, w, h);
 
@@ -839,14 +948,6 @@ async function detectLoop() {
 
   const t0 = performance.now();
 
-  const inputTensor = preprocess(video);
-  const tPreprocess = performance.now();
-
-  const output = await session.run({ [inputName]: inputTensor });
-  const tInference = performance.now();
-  inputTensor.dispose();
-
-  // Ensure overlay canvas matches video native resolution
   const vidW = video.videoWidth;
   const vidH = video.videoHeight;
   if (overlay.width !== vidW || overlay.height !== vidH) {
@@ -854,33 +955,76 @@ async function detectLoop() {
   }
 
   let detections, masksData = null, maskDims = null;
-  if (family === "yolo") {
-    const out0 = output.output0;
-    const stride = out0.dims[2];               // 6 (det) or 38 (seg)
-    detections = postprocessYolo(out0.data, stride, vidW, vidH);
-    if (hasSegmentation && detections.length) {
-      const proto = output.output1;
-      const built = buildYoloMasks(detections, out0.data, stride, proto.data, proto.dims);
-      masksData = built.masksData;
-      maskDims = built.maskDims;
-    }
-    for (const k in output) output[k].dispose();
-  } else {
-    detections = postprocess(output.dets.data, output.labels.data, vidW, vidH);
-    masksData = hasSegmentation ? output.masks.data : null;
-    maskDims = hasSegmentation ? output.masks.dims : null;
-    output.dets.dispose();
-    output.labels.dispose();
-    if (output.masks) output.masks.dispose();
-  }
-  const tPostprocess = performance.now();
+  let tPreprocess, tInference, tPostprocess;
+  let bridgeServer = null, bridgeSpeed = null;
 
-  drawDetections(detections, vidW, vidH, masksData, maskDims);
+  if (usingBridge) {
+    // Native Python inference over the WebSocket. Send the frame, await decoded
+    // dets + masks (same shape as the ONNX path), draw with the shared code.
+    prepCtx.drawImage(video, 0, 0, inputSize, inputSize);
+    const imageData = prepCtx.getImageData(0, 0, inputSize, inputSize);
+    tPreprocess = performance.now();
+    const buf = await bridge.infer(imageData);
+    tInference = performance.now();
+    if (!buf) {                       // disconnected / no result
+      statusEl.childNodes[0].textContent = "Python bridge disconnected.";
+      running = false;
+      return;
+    }
+    const r = decodeBridgeResult(buf, vidW, vidH);
+    if (r.matte) {
+      // One person-union mask. Wrap as a single synthetic person detection so
+      // drawCutout works unchanged (it filters person + unions).
+      detections = [{ classId: family === "yolo" ? 0 : 1, queryIdx: 0, score: 1 }];
+      masksData = r.alpha;
+      maskDims = [1, 1, r.mh, r.mw];
+    } else {
+      detections = r.detections;
+      masksData = r.masksData;
+      maskDims = r.maskDims;
+    }
+    bridgeServer = r.server;          // {parse, predict, encode}
+    bridgeSpeed = r.speed;            // {preprocess, inference, postprocess} (torch yolo)
+    tPostprocess = performance.now();
+  } else {
+    const inputTensor = preprocess(video);
+    tPreprocess = performance.now();
+    const output = await session.run({ [inputName]: inputTensor });
+    tInference = performance.now();
+    inputTensor.dispose();
+
+    if (family === "yolo") {
+      const out0 = output.output0;
+      const stride = out0.dims[2];             // 6 (det) or 38 (seg)
+      detections = postprocessYolo(out0.data, stride, vidW, vidH);
+      if (hasSegmentation && detections.length) {
+        const proto = output.output1;
+        const built = buildYoloMasks(detections, out0.data, stride, proto.data, proto.dims);
+        masksData = built.masksData;
+        maskDims = built.maskDims;
+      }
+      for (const k in output) output[k].dispose();
+    } else {
+      detections = postprocess(output.dets.data, output.labels.data, vidW, vidH);
+      masksData = hasSegmentation ? output.masks.data : null;
+      maskDims = hasSegmentation ? output.masks.dims : null;
+      output.dets.dispose();
+      output.labels.dispose();
+      if (output.masks) output.masks.dispose();
+    }
+    tPostprocess = performance.now();
+  }
+
+  if (cutoutMode) {
+    drawCutout(detections, masksData, maskDims, vidW, vidH);
+  } else {
+    drawDetections(detections, vidW, vidH, masksData, maskDims);
+  }
   const tDraw = performance.now();
 
   let tSidebar = tDraw;
   frameCount++;
-  if (showSegments && frameCount % 3 === 0) {
+  if (showSegments && !cutoutMode && frameCount % 3 === 0) {
     updateSidebar(detections, masksData, maskDims, vidW, vidH);
     tSidebar = performance.now();
   }
@@ -888,35 +1032,57 @@ async function detectLoop() {
   const mode = hasSegmentation ? "seg" : "det";
   // Rolling median per stage (n=60) — same as the python cam HUD, so the two
   // are directly comparable instead of reading jittery instantaneous values.
-  pushStat({
-    pre: tPreprocess - t0,
-    inf: tInference - tPreprocess,
-    post: tPostprocess - tInference,
+  const stat = {
+    pre: tPreprocess - t0,            // browser: getImageData / preprocess
+    inf: tInference - tPreprocess,    // bridge: full round-trip; onnx: session.run
+    post: tPostprocess - tInference,  // browser decode
     draw: tDraw - tPostprocess,
     total: tSidebar - t0,
-  });
+  };
+  if (usingBridge && bridgeServer) {
+    // Split the round-trip to expose overhead-over-raw-inference.
+    const sParse = bridgeServer.parse || 0;
+    const sPredict = bridgeServer.predict || 0;   // full predict wall (incl sv mask conv)
+    const sEncode = bridgeServer.encode || 0;     // serialize + mask resize
+    const sModel = bridgeSpeed ? bridgeSpeed.inference : sPredict;  // pure model fwd
+    stat.srv = sParse + sPredict + sEncode;        // total server time
+    stat.wire = (tInference - tPreprocess) - stat.srv;  // websocket + tunnel
+    stat.model = sModel;
+    stat.sParse = sParse;
+    stat.sEnc = sEncode + (bridgeServer.maskresize || 0);
+    stat.sConv = sPredict - sModel;                // sv mask materialization (predict - pure)
+  }
+  pushStat(stat);
   const m = medianStats();
-  statsEl.textContent = [
+
+  const base = [
     `pre:${m.pre.toFixed(1)}`,
     `inf:${m.inf.toFixed(1)} (${(1000 / m.inf).toFixed(0)}fps)`,
     `post:${m.post.toFixed(1)}`,
     `draw:${m.draw.toFixed(1)}`,
     `total:${m.total.toFixed(1)}ms (${(1000 / m.total).toFixed(0)}fps)`,
     `${detections.length}obj ${mode} ${inputSize}px ${family}`,
-  ].join(" | ");
+  ];
+  if (usingBridge && bridgeServer) {
+    base.push(
+      `‖ rtt:${m.inf.toFixed(1)} = model:${m.model.toFixed(1)} + conv:${m.sConv.toFixed(1)} + ` +
+      `enc:${m.sEnc.toFixed(1)} + parse:${m.sParse.toFixed(1)} + wire:${m.wire.toFixed(1)}`
+    );
+  }
+  statsEl.textContent = base.join(" | ");
 
   requestAnimationFrame(detectLoop);
 }
 
 // --- Rolling-median stats (matches python cam-detect HUD) ---
-const STAT_KEYS = ["pre", "inf", "post", "draw", "total"];
 let statHist = [];
-let statModelId = null;
+let statKey = null;
 
 function pushStat(s) {
-  if (statModelId !== currentModelId) {  // reset window on model switch
+  const key = `${currentModelId}|${activeBackend}`;
+  if (statKey !== key) {  // reset window on model OR backend switch
     statHist = [];
-    statModelId = currentModelId;
+    statKey = key;
   }
   statHist.push(s);
   if (statHist.length > 60) statHist.shift();
@@ -924,8 +1090,9 @@ function pushStat(s) {
 
 function medianStats() {
   const out = {};
-  for (const k of STAT_KEYS) {
-    const vals = statHist.map(s => s[k]).sort((a, b) => a - b);
+  if (!statHist.length) return out;
+  for (const k of Object.keys(statHist[statHist.length - 1])) {
+    const vals = statHist.map(s => s[k]).filter(v => v != null).sort((a, b) => a - b);
     out[k] = vals.length ? vals[vals.length >> 1] : 0;
   }
   return out;

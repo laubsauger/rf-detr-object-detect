@@ -30,19 +30,22 @@ def color_for(class_id):
 
 
 def draw_masks_fast(frame, detections, alpha=0.45):
-    """Single colored overlay blended once over the union of masks. Cost scales
-    with frame area, so the loop caps the processing resolution (--size) — that
-    is the real lever (640px-wide ~4ms vs 1280px ~17ms)."""
+    """Blend each mask only inside its own bounding box — cost scales with the
+    sum of box areas, not the whole frame. Avoids the full-frame addWeighted /
+    per-mask full-res assignment that made the naive version ~18ms."""
     if detections.mask is None or len(detections) == 0:
         return
-    overlay = frame.copy()
-    anym = np.zeros(frame.shape[:2], bool)
-    for m, cid in zip(detections.mask, detections.class_id):
-        overlay[m] = color_for(cid)
-        anym |= m
-    if not anym.any():
-        return
-    frame[anym] = cv2.addWeighted(frame, 1 - alpha, overlay, alpha, 0)[anym]
+    H, W = frame.shape[:2]
+    for m, cid, box in zip(detections.mask, detections.class_id, detections.xyxy):
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        sub = frame[y1:y2, x1:x2]
+        sm = m[y1:y2, x1:x2]
+        color = np.array(color_for(cid), np.float32)
+        sub[sm] = (sub[sm] * (1 - alpha) + color * alpha).astype(np.uint8)
 
 
 def fit(frame, long_side):

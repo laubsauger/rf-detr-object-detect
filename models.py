@@ -131,6 +131,76 @@ class YOLOModel(Model):
         self.last_speed = dict(res.speed)  # {"preprocess","inference","postprocess"} ms
         return sv.Detections.from_ultralytics(res)
 
+    # --- fast path for the bridge: forward via ultralytics' optimized backend,
+    #     decode masks at proto res (no 640 upsample, no sv conversion). ~2x. ---
+    def _backend(self):
+        if getattr(self, "_be", None) is None:
+            import numpy as np
+            warm = np.zeros((self.resolution, self.resolution, 3), np.uint8)
+            self.model.predict(warm, imgsz=self.resolution, device=DEVICE, verbose=False)
+            self._be = self.model.predictor.model  # AutoBackend (warmed, fused, fp16-aware)
+        return self._be
+
+    def predict_fast(self, rgb, threshold):
+        """rgb: HWC uint8 RGB. Returns {xyxyn, scores, classes,
+        masks(uint8 N,mh,mw|None), mh, mw} — boxes normalized 0..1 in model
+        space, masks at proto res cropped to box. Mirrors the ONNX/web decode;
+        avoids ultralytics' full-res mask postprocess."""
+        import time
+        import cv2
+        import numpy as np
+        import torch
+
+        be = self._backend()
+        R = self.resolution
+        if rgb.shape[0] != R or rgb.shape[1] != R:
+            rgb = cv2.resize(rgb, (R, R))
+
+        t0 = time.perf_counter()
+        # Single CPU copy: HWC view -> contiguous CHW (writable, so no read-only
+        # warning and no extra GPU .contiguous()).
+        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1))
+        x = torch.from_numpy(chw).to(DEVICE).unsqueeze(0).float().div_(255)
+        if getattr(be, "fp16", False):
+            x = x.half()
+        t1 = time.perf_counter()
+        with torch.inference_mode():
+            out = be(x)
+        if DEVICE == "mps":
+            torch.mps.synchronize()
+        t2 = time.perf_counter()
+
+        preds = out[0]
+        if isinstance(preds, (list, tuple)):           # seg: (dets, proto)
+            dets, proto = preds[0][0].float().cpu().numpy(), preds[1][0].float().cpu().numpy()
+        else:                                          # det: just dets
+            dets, proto = preds[0].float().cpu().numpy(), None
+
+        keep = dets[:, 4] >= threshold
+        kept = dets[keep]
+        xyxyn = kept[:, :4] / R
+        scores = kept[:, 4].copy()
+        classes = kept[:, 5].astype(int)
+
+        masks = None
+        mh = mw = 0
+        if proto is not None and len(kept):
+            nm, mh, mw = proto.shape
+            logits = (kept[:, 6:6 + nm] @ proto.reshape(nm, -1)).reshape(-1, mh, mw)
+            keepm = logits > 0                          # sigmoid > 0.5
+            bx1 = (xyxyn[:, 0] * mw)[:, None, None]; bx2 = (xyxyn[:, 2] * mw)[:, None, None]
+            by1 = (xyxyn[:, 1] * mh)[:, None, None]; by2 = (xyxyn[:, 3] * mh)[:, None, None]
+            xs = np.arange(mw)[None, None, :]; ys = np.arange(mh)[None, :, None]
+            masks = (keepm & (xs >= bx1) & (xs < bx2) & (ys >= by1) & (ys < by2)).astype(np.uint8)
+
+        self.last_speed = {
+            "preprocess": round((t1 - t0) * 1000, 2),
+            "inference": round((t2 - t1) * 1000, 2),
+            "postprocess": round((time.perf_counter() - t2) * 1000, 2),
+        }
+        return {"xyxyn": xyxyn, "scores": scores, "classes": classes,
+                "masks": masks, "mh": mh, "mw": mw}
+
 
 class MLXYOLOModel(Model):
     """YOLO26 running natively on MLX (Apple Silicon Metal) — no torch at runtime."""

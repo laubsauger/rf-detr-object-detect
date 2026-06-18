@@ -744,9 +744,21 @@ function drawMasks(detections, masksData, maskDims, vidW, vidH) {
 }
 
 // Person-only background removal. Builds a person-union alpha at proto res
-// (cheap), then composites video × mask on the GPU (drawImage + destination-in)
-// — no full-res per-pixel JS, no boxes/contours/sidebar.
+// (cheap), then composites the INFERENCE-TIME frame snapshot × mask on the GPU
+// (drawImage + destination-in). Compositing the snapshot — not the live video —
+// keeps the mask aligned with the pixels it was computed from (the video has
+// advanced ~inference-latency ms by the time the mask arrives).
 let cutMask = null, cutMaskCtx = null;
+let snapCanvas = null, snapCtx = null;
+
+function snapshotFrame(w, h) {
+  if (!snapCanvas || snapCanvas.width !== w || snapCanvas.height !== h) {
+    snapCanvas = new OffscreenCanvas(w, h);
+    snapCtx = snapCanvas.getContext("2d");
+  }
+  snapCtx.drawImage(video, 0, 0, w, h);   // un-mirrored frame at inference time
+}
+
 function drawCutout(detections, masksData, maskDims, w, h) {
   ctx.clearRect(0, 0, w, h);
   if (!masksData || !maskDims) return;
@@ -770,13 +782,13 @@ function drawCutout(detections, masksData, maskDims, w, h) {
   if (!any) return;
   cutMaskCtx.putImageData(img, 0, 0);
 
-  // video drawn mirrored (CSS-flipped feed); mask is un-mirrored model space, so
-  // mirror it too when used as the alpha.
+  // snapshot drawn mirrored (CSS-flipped feed); mask is un-mirrored model space,
+  // so mirror it too when used as the alpha.
   ctx.save();
   ctx.translate(w, 0); ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, w, h);
+  ctx.drawImage(snapCanvas, 0, 0, w, h);   // the frame inference saw, not live video
   ctx.globalCompositeOperation = "destination-in";
-  ctx.drawImage(cutMask, 0, 0, w, h);   // GPU upscale 160² -> w×h
+  ctx.drawImage(cutMask, 0, 0, w, h);      // GPU upscale 160² -> w×h
   ctx.restore();
   ctx.globalCompositeOperation = "source-over";
 }
@@ -953,6 +965,10 @@ async function detectLoop() {
   if (overlay.width !== vidW || overlay.height !== vidH) {
     syncOverlay();
   }
+
+  // Snapshot the frame inference is about to consume, so the cutout composites
+  // the mask against the matching pixels (not the video advanced during await).
+  if (cutoutMode) snapshotFrame(vidW, vidH);
 
   let detections, masksData = null, maskDims = null;
   let tPreprocess, tInference, tPostprocess;

@@ -31,20 +31,28 @@ fast YOLO path too; RF-DETR takes the `sv.Detections` branch).
 - One request in flight (send next frame only after prev result).
 - HTTPS page → proxy `wss://host/bridge` (vite `proxy:{ "/bridge":{ws:true} }`).
 
-## Browser composite
+## Browser composite (+ latency sync)
+
+The mask is for a frame from ~inference-ms ago. **Snapshot that frame at send
+time and composite against the snapshot, not the live video** — else the mask
+trails a moving person.
 
 ```js
-// build alpha at proto res, then GPU-scale as the matte
-maskCtx.putImageData(alphaImageData, 0, 0);   // 160², a[i*4+3]=255 where mask>0
+// 1. at inference time (top of loop, before await): freeze the frame
+snapCtx.drawImage(video, 0, 0, w, h);              // snapCanvas = what inference saw
+
+// 2. when the mask returns: build alpha at proto res, then GPU-scale as matte
+maskCtx.putImageData(alphaImageData, 0, 0);        // 160², a[i*4+3]=255 where mask>0
 ctx.save(); ctx.translate(w,0); ctx.scale(-1,1);   // mirror to match CSS-flipped video
-ctx.drawImage(video, 0, 0, w, h);
+ctx.drawImage(snapCanvas, 0, 0, w, h);             // <- snapshot, NOT live video
 ctx.globalCompositeOperation = "destination-in";
 ctx.drawImage(maskCanvas, 0, 0, w, h);             // upscale 160² -> w×h on GPU
 ctx.restore(); ctx.globalCompositeOperation = "source-over";
 ```
 
-Hide the `<video>` (`opacity:0`, black pane bg) so the transparent overlay reads
-as person-on-black. See `drawCutout` in `web/src/main.js`.
+Hide the live `<video>` (`opacity:0`, black pane bg) so the transparent overlay
+reads as person-on-black. The cutout lags real-time by inference latency but
+stays aligned. See `snapshotFrame` + `drawCutout` in `web/src/main.js`.
 
 ## Numbers (M-series, seg-nano)
 
@@ -57,3 +65,8 @@ speed. The roundtrip/transport itself is <2 ms.
 - RF-DETR person class = **1** (COCO cat-id), not 0.
 - Mask is in un-mirrored model space; mirror it at draw time (video is CSS-flipped).
 - Don't materialize full-res masks per frame — union first, ship at 160².
+- **Latency sync (critical):** the mask is for a frame from ~inference-ms ago.
+  Do NOT composite it against the *live* video — snapshot the frame at send time
+  (`snapshotFrame` in `main.js`) and composite mask × snapshot. Hide the live
+  `<video>`. Result lags real-time by inference latency but stays aligned;
+  compositing live video makes the mask trail a moving person.

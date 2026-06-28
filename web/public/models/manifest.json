@@ -10,5 +10,9 @@
   { "id": "yolo26n-seg", "label": "YOLO26 Seg Nano", "resolution": 640, "family": "yolo", "task": "seg" },
   { "id": "yolo26s-seg", "label": "YOLO26 Seg Small", "resolution": 640, "family": "yolo", "task": "seg" },
   { "id": "yolo26n", "label": "YOLO26 Det Nano", "resolution": 640, "family": "yolo", "task": "det" },
-  { "id": "yolo26s", "label": "YOLO26 Det Small", "resolution": 640, "family": "yolo", "task": "det" }
+  { "id": "yolo26s", "label": "YOLO26 Det Small", "resolution": 640, "family": "yolo", "task": "det" },
+  { "id": "rtmw-m", "label": "RTMW-m Pose (256x192)", "resW": 192, "resH": 256, "family": "rtmw", "task": "pose" },
+  { "id": "rtmw-l", "label": "RTMW-l Pose (256x192)", "resW": 192, "resH": 256, "family": "rtmw", "task": "pose" },
+  { "id": "rtmw-l-384", "label": "RTMW-l Pose (384x288)", "resW": 288, "resH": 384, "family": "rtmw", "task": "pose" },
+  { "id": "rtmw3d-x", "label": "RTMW3D-x Pose 3D (384x288)", "resW": 288, "resH": 384, "family": "rtmw3d", "task": "pose3d" }
 ]

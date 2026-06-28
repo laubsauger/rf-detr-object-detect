@@ -11,6 +11,10 @@ import json
 import subprocess
 import sys
 import os
+import shutil
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -82,6 +86,58 @@ SPECS = {
     "yolo26s-seg":  dict(family="yolo", weights="yolo26s-seg.pt", resolution=640),
 }
 
+# RTMW whole-body pose (rtmlib prebuilt onnx, zip contains end2end.onnx). Too
+# large for git (123-219MB) -> downloaded here so clones reproduce. fp16 variants
+# (inference_model_fp16.onnx) are converted locally (keep_io_types -> fp32 IO).
+RTMLIB = "https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk"
+RTMW = {
+    "rtmw-m":     f"{RTMLIB}/rtmw-dw-l-m_simcc-cocktail14_270e-256x192_20231122.zip",
+    "rtmw-l":     f"{RTMLIB}/rtmw-dw-x-l_simcc-cocktail14_270e-256x192_20231122.zip",
+    "rtmw-l-384": f"{RTMLIB}/rtmw-dw-x-l_simcc-cocktail14_270e-384x288_20231122.zip",
+}
+# Extra detector input resolutions for the pose top-down crop (640 = base export).
+# The web pose UI lets you pick these; lower res = faster person boxes.
+DET_RES = [320, 384, 512]
+
+# RTMW3D whole-body 3D pose (single .onnx, ~352MB, from HuggingFace). Top-down,
+# same crop path as 2D RTMW but 3 SimCC axes (x,y,z).
+RTMW3D = {
+    "rtmw3d-x": "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/"
+                "rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx",
+}
+
+
+def download_url(url, dst):
+    print(f"  downloading {os.path.basename(dst)} (~350MB)...")
+    urllib.request.urlretrieve(url, dst)
+
+
+def download_rtmw(mid, output_dir):
+    url = RTMW[mid]
+    print(f"  downloading RTMW {mid} from rtmlib (~120-220MB)...")
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        urllib.request.urlretrieve(url, tmp.name)
+        with zipfile.ZipFile(tmp.name) as z, \
+                z.open("end2end.onnx") as src, \
+                open(os.path.join(output_dir, "inference_model.onnx"), "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    os.unlink(tmp.name)
+
+
+def convert_fp16(src, dst):
+    import onnx
+    from onnxconverter_common import float16
+    # keep_io_types=True: inputs/outputs stay fp32 (internal fp16), so the web
+    # preprocess + SimCC decode need no dtype changes.
+    m16 = float16.convert_float_to_float16(onnx.load(src), keep_io_types=True)
+    onnx.save(m16, dst)
+
+
+def export_yolo_res(res, dst):
+    from ultralytics import YOLO
+    p = YOLO(str(ROOT / "yolo26n.pt")).export(format="onnx", imgsz=res, opset=17, verbose=False)
+    shutil.move(str(p), dst)
+
 
 def get_spec(model_id):
     if model_id not in SPECS:
@@ -119,42 +175,71 @@ def export_yolo(spec, output_dir):
     shutil.move(str(onnx_path), os.path.join(output_dir, "inference_model.onnx"))
 
 
+def ensure_model(mid):
+    """Produce every artifact a model needs, skipping ones already on disk.
+    Returns True if any work was done."""
+    out_dir = MODELS_DIR / mid
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = out_dir / "inference_model.onnx"
+    did = False
+
+    # --- RTMW pose: download base + convert fp16 ---
+    if mid in RTMW:
+        if not base.exists():
+            download_rtmw(mid, str(out_dir))
+            print(f"  -> {base} ({base.stat().st_size // (1024*1024)} MB)")
+            did = True
+        fp16 = out_dir / "inference_model_fp16.onnx"
+        if not fp16.exists():
+            print(f"  converting {mid} -> fp16...")
+            convert_fp16(str(base), str(fp16))
+            did = True
+        return did
+
+    # --- RTMW3D pose: download single onnx (no zip, no fp16) ---
+    if mid in RTMW3D:
+        if not base.exists():
+            download_url(RTMW3D[mid], str(base))
+            print(f"  -> {base} ({base.stat().st_size // (1024*1024)} MB)")
+            did = True
+        return did
+
+    # --- RF-DETR / YOLO base export ---
+    spec = get_spec(mid)
+    if not base.exists():
+        print(f"Exporting {mid} ({spec['family']})...")
+        if spec["family"] == "rfdetr":
+            export_rfdetr(spec, str(out_dir))
+        else:
+            export_yolo(spec, str(out_dir))
+        print(f"  -> {base}")
+        did = True
+
+    # --- yolo26n is the pose detector: also emit lower-res variants ---
+    if mid == "yolo26n":
+        for res in DET_RES:
+            dst = out_dir / f"inference_model_{res}.onnx"
+            if not dst.exists():
+                print(f"  detector variant yolo26n @ {res}...")
+                export_yolo_res(res, str(dst))
+                did = True
+
+    return did
+
+
 def main():
     ensure_venv()
     run_in_venv()
 
-    # If we get here, rfdetr is available
     model_ids = sys.argv[1:] if sys.argv[1:] else models_from_manifest()
-
-    missing = []
+    any_work = False
     for mid in model_ids:
-        onnx_path = MODELS_DIR / mid / "inference_model.onnx"
-        if onnx_path.exists():
-            size_mb = onnx_path.stat().st_size / (1024 * 1024)
-            print(f"  {mid}: already exists ({size_mb:.0f} MB), skipping")
+        if ensure_model(mid):
+            any_work = True
         else:
-            missing.append(mid)
+            print(f"  {mid}: all artifacts present, skipping")
 
-    if not missing:
-        print("All models already exported.")
-        return
-
-    print(f"\nExporting {len(missing)} model(s): {', '.join(missing)}")
-    print("This will download PyTorch weights and convert to ONNX.\n")
-
-    for mid in missing:
-        spec = get_spec(mid)
-        output_dir = str(MODELS_DIR / mid)
-        os.makedirs(output_dir, exist_ok=True)
-
-        print(f"Exporting {mid} ({spec['family']})...")
-        if spec["family"] == "rfdetr":
-            export_rfdetr(spec, output_dir)
-        else:
-            export_yolo(spec, output_dir)
-        print(f"  -> {output_dir}/inference_model.onnx\n")
-
-    print("Done. All models exported.")
+    print("Done." if any_work else "All models already present.")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@
     video { display: block; transform: scaleX(-1); width: 100%; height: 100%; object-fit: contain; }
     #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; object-fit: contain; }
     #stats { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.75); padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-variant-numeric: tabular-nums; z-index: 2; color: #eee; }
+    #pose3d { position: absolute; bottom: 8px; right: 8px; width: 300px; height: 360px; z-index: 6; border: 1px solid #333; border-radius: 8px; background: #0a0a0f; display: none; cursor: grab; touch-action: none; }
 
     /* Floating control panel */
     #panel-toggle { position: absolute; top: 8px; left: 8px; z-index: 20; width: 32px; height: 32px; border: 1px solid #555; background: rgba(0,0,0,0.6); color: #eee; border-radius: 6px; cursor: pointer; font-size: 1.1rem; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(8px); }
@@ -74,6 +75,7 @@
       </div>
       <video id="video" autoplay playsinline muted></video>
       <canvas id="overlay"></canvas>
+      <canvas id="pose3d" width="300" height="360"></canvas>
       <div id="stats"></div>
       <div id="progress-bar"><div id="progress-fill"></div></div>
 
@@ -99,6 +101,37 @@
           <div class="ctrl-row"><span>Confidence</span><input type="range" id="threshold" min="0.1" max="0.9" step="0.05" value="0.5"><span class="ctrl-val" id="threshVal">0.50</span></div>
           <div class="ctrl-row"><span>Mask fill</span><input type="range" id="maskOpacity" min="0" max="1" step="0.05" value="0.4"><span class="ctrl-val" id="maskOpacityVal">0.40</span></div>
           <div class="ctrl-row"><span>Outline</span><input type="range" id="outlineOpacity" min="0" max="1" step="0.05" value="0.85"><span class="ctrl-val" id="outlineOpacityVal">0.85</span></div>
+        </div>
+
+        <div class="ctrl-group" id="pose-controls" style="display:none;">
+          <label>Pose mode <select id="poseMode">
+            <option value="all">Detector · all people</option>
+            <option value="cap3">Detector · up to 3</option>
+            <option value="cap2">Detector · up to 2</option>
+            <option value="single">Detector · single (top-1)</option>
+            <option value="exclusive">Whole frame (no detector, debug)</option>
+          </select></label>
+          <label>Precision <select id="posePrecision">
+            <option value="fp32">fp32</option>
+            <option value="fp16">fp16 (smaller, ~8% faster)</option>
+          </select></label>
+          <label>Detector res <select id="detRes">
+            <option value="640">640</option>
+            <option value="512" selected>512</option>
+            <option value="384">384</option>
+            <option value="320">320</option>
+          </select></label>
+          <div class="ctrl-row"><span>Keypoint</span><input type="range" id="kptThresh" min="0" max="1" step="0.02" value="0.3"><span class="ctrl-val" id="kptThreshVal">0.30</span></div>
+          <label><input type="checkbox" id="showBody" checked> Body + feet</label>
+          <label><input type="checkbox" id="showHands" checked> Hands</label>
+          <label><input type="checkbox" id="showFace" checked> Face</label>
+          <label><input type="checkbox" id="poseOverlay" checked> Overlay on</label>
+          <div id="pose3d-controls" style="display:none; flex-direction:column; gap:6px; border-top:1px solid #222; padding-top:6px;">
+            <div class="ctrl-row"><span>Depth</span><input type="range" id="depthScale" min="0.5" max="4" step="0.1" value="1.5"><span class="ctrl-val" id="depthScaleVal">1.5×</span></div>
+            <label><input type="checkbox" id="autoRotate" checked> Auto-rotate 3D</label>
+            <button id="resetView">Reset 3D view</button>
+            <div class="status-line">drag rotate · right-drag pan · wheel zoom</div>
+          </div>
         </div>
 
         <div class="ctrl-group">

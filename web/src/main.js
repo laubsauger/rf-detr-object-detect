@@ -1,5 +1,6 @@
 import * as ort from "onnxruntime-web";
 import { createBridge, decodeBridgeResult } from "./bridge.js";
+import { initPose3d, updatePose3d, setPose3dRunning, setAutoRotate, resetView, onPose3dInteract } from "./pose3d.js";
 
 ort.env.logLevel = "error";
 ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
@@ -71,6 +72,42 @@ const YOLO_CLASSES = [
 ];
 const YOLO_COLORS = YOLO_CLASSES.map((_, i) => `hsl(${(i * 37) % 360}, 70%, 55%)`);
 
+// --- RTMW whole-body pose (COCO-WholeBody 133) — V5 topology ---
+// 0-16 body, 17-22 foot, 23-90 face, 91-111 L-hand, 112-132 R-hand.
+const NUM_KPTS = 133;
+const BODY_EDGES = [
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],   // shoulders + arms
+  [5, 11], [6, 12], [11, 12],                // torso
+  [11, 13], [13, 15], [12, 14], [14, 16],    // legs
+  [0, 1], [0, 2], [1, 3], [2, 4],            // nose-eyes-ears
+  [3, 5], [4, 6],                            // ears-shoulders
+];
+const FOOT_EDGES = [
+  [15, 17], [15, 18], [15, 19],   // L ankle -> big toe / small toe / heel
+  [16, 20], [16, 21], [16, 22],   // R ankle -> ...
+];
+// 21-pt hand: wrist=base, then 5 fingers × 4 joints (thumb,index,middle,ring,pinky).
+function handEdges(base) {
+  const e = [];
+  for (const off of [1, 5, 9, 13, 17]) {
+    e.push([base, base + off], [base + off, base + off + 1],
+           [base + off + 1, base + off + 2], [base + off + 2, base + off + 3]);
+  }
+  return e;
+}
+// group -> kpt index range [lo,hi), distinct colour (V12), bone edges (face = dots only, V11).
+const POSE_GROUPS = [
+  { key: "body",  lo: 0,   hi: 23,  color: "#00e5ff", edges: BODY_EDGES.concat(FOOT_EDGES) },
+  { key: "face",  lo: 23,  hi: 91,  color: "#ff5cf0", edges: [] },
+  { key: "lhand", lo: 91,  hi: 112, color: "#ffa726", edges: handEdges(91) },
+  { key: "rhand", lo: 112, hi: 133, color: "#ffd54f", edges: handEdges(112) },
+];
+// RTMW preprocessing (pipeline.json, to_rgb=True) — V3. RGB, 0-255 scale.
+const POSE_MEAN = [123.675, 116.28, 103.53];
+const POSE_STD = [58.395, 57.12, 57.375];
+const POSE_PADDING = 1.25;   // pipeline.json TopDownGetBboxCenterScale
+const Z_RANGE = 2.1744869;   // RTMW3D depth scale (rtmlib RTMPose3d default) — V16
+
 // Active lookup tables — swapped on model load based on family.
 let activeNames = COCO_CLASSES;
 let activeColors = COLORS;
@@ -107,6 +144,24 @@ const outlineOpacityValEl = document.getElementById("outlineOpacityVal");
 const controlPanel = document.getElementById("control-panel");
 const panelToggle = document.getElementById("panel-toggle");
 const panelClose = document.getElementById("panelClose");
+// Pose (RTMW) controls
+const poseControls = document.getElementById("pose-controls");
+const poseModeSelect = document.getElementById("poseMode");
+const kptThreshInput = document.getElementById("kptThresh");
+const kptThreshVal = document.getElementById("kptThreshVal");
+const showBodyCb = document.getElementById("showBody");
+const showHandsCb = document.getElementById("showHands");
+const showFaceCb = document.getElementById("showFace");
+const poseOverlayCb = document.getElementById("poseOverlay");
+const precisionSelect = document.getElementById("posePrecision");
+const detResSelect = document.getElementById("detRes");
+const pose3dCanvas = document.getElementById("pose3d");
+const pose3dControls = document.getElementById("pose3d-controls");
+const autoRotateCb = document.getElementById("autoRotate");
+const resetViewBtn = document.getElementById("resetView");
+const depthScaleInput = document.getElementById("depthScale");
+const depthScaleVal = document.getElementById("depthScaleVal");
+let pose3dReady = false;   // three.js scene initialized lazily on first 3D model load
 
 // State
 let session = null;
@@ -127,6 +182,20 @@ let showSegments = false;
 let cutoutMode = false;
 let maskOpacity = 0.4;
 let outlineOpacity = 0.85;
+
+// --- RTMW pose state ---
+let poseW = 192, poseH = 256;            // model input W,H per variant (V1)
+let poseInputBuf = null, poseCanvas = null, poseCtx = null;
+let detSession = null, detBuf = null, detCanvas = null, detCtx = null;  // optional person detector
+let detRes = 512;                        // detector input res (UI: 640/512/384/320) — 512 default
+let posePrecision = "fp32";              // fp32 | fp16 (UI; fp16 ~halves download, ~8% faster on webgpu)
+let poseMode = "all";                    // all | cap3 | cap2 | single | exclusive (debug) — V10
+let detLoadFailed = false;               // detector load errored — stop retrying every frame
+let kptThresh = 0.3;                      // per-keypoint score gate (V9)
+let showBody = true, showHands = true, showFace = true, poseOverlayOn = true;  // V14
+let depthScale = 1.5;                     // 3D viewer depth exaggeration (V16/V17)
+const poseProf = {};                      // per-stage timing (ms), read via window.__poseProf
+if (typeof window !== "undefined") window.__poseProf = poseProf;
 
 let inputBuf = null;
 let prepCanvas = null;
@@ -269,6 +338,37 @@ maskOpacityInput.addEventListener("input", () => {
   maskOpacityVal.textContent = maskOpacity.toFixed(2);
 });
 
+// --- Pose controls (V10 mode, V9 threshold, V14 per-group toggles) ---
+poseModeSelect.addEventListener("change", () => {
+  poseMode = poseModeSelect.value;
+  if (poseMode !== "exclusive") ensureDetector();   // lazy-load yolo26n on first detector use
+});
+kptThreshInput.addEventListener("input", () => {
+  kptThresh = parseFloat(kptThreshInput.value);
+  kptThreshVal.textContent = kptThresh.toFixed(2);
+});
+showBodyCb.addEventListener("change", () => { showBody = showBodyCb.checked; });
+showHandsCb.addEventListener("change", () => { showHands = showHandsCb.checked; });
+showFaceCb.addEventListener("change", () => { showFace = showFaceCb.checked; });
+poseOverlayCb.addEventListener("change", () => { poseOverlayOn = poseOverlayCb.checked; });
+precisionSelect.addEventListener("change", () => {
+  posePrecision = precisionSelect.value;
+  if (currentModelId && family === "rtmw") loadModel(currentModelId);   // reload pose at new precision
+});
+detResSelect.addEventListener("change", () => {
+  detRes = parseInt(detResSelect.value, 10);
+  detSession = null; detLoadFailed = false;        // force detector reload at the new res
+  if (poseMode !== "exclusive") ensureDetector();
+});
+
+// 3D viewer orbit controls
+autoRotateCb.addEventListener("change", () => setAutoRotate(autoRotateCb.checked));
+resetViewBtn.addEventListener("click", () => { resetView(); autoRotateCb.checked = true; });
+depthScaleInput.addEventListener("input", () => {
+  depthScale = parseFloat(depthScaleInput.value);
+  depthScaleVal.textContent = depthScale.toFixed(1) + "×";
+});
+
 showSegmentsCheckbox.addEventListener("change", () => {
   showSegments = showSegmentsCheckbox.checked;
   segmentPane.classList.toggle("visible", showSegments);
@@ -312,13 +412,26 @@ async function loadModel(modelId) {
   currentModelId = modelId;
 
   const meta = manifest.find(m => m.id === modelId);
-  inputSize = meta.resolution;
   family = meta.family || "rfdetr";
+  const is3d = family === "rtmw3d";
+  const isPose = family === "rtmw" || is3d;
+  if (isPose) { poseW = meta.resW; poseH = meta.resH; inputSize = meta.resW; }
+  else { inputSize = meta.resolution; }
   inputName = family === "yolo" ? "images" : "input";
   activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
   activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
+  // Pose controls only apply to the rtmw family.
+  poseControls.style.display = isPose ? "" : "none";
 
   const preferredBackend = backendSelect.value;
+
+  // RTMW runs in-browser only — no pose model on the python bridge server.
+  if (isPose && preferredBackend.startsWith("python")) {
+    statusEl.childNodes[0].textContent = "RTMW pose runs in-browser — pick WebGPU or WASM.";
+    loading = false;
+    modelSelect.disabled = false;
+    return;
+  }
 
   // --- Python bridge backend (native MPS / MLX over WebSocket) ---
   if (preferredBackend.startsWith("python")) {
@@ -330,7 +443,10 @@ async function loadModel(modelId) {
   }
   if (bridge) { bridge.close(); bridge = null; usingBridge = false; }
 
-  const modelUrl = `/models/${modelId}/inference_model.onnx`;
+  // RTMW (2D) fp16 variant keeps fp32 IO, so decode/preprocess are unchanged.
+  // rtmw3d has no fp16 variant — always fp32.
+  const fileName = (family === "rtmw" && posePrecision === "fp16") ? "inference_model_fp16.onnx" : "inference_model.onnx";
+  const modelUrl = `/models/${modelId}/${fileName}`;
   const backends = preferredBackend === "auto"
     ? ["webgpu", "wasm"]
     : [preferredBackend];
@@ -380,14 +496,41 @@ async function loadModel(modelId) {
 
   hasSegmentation = meta.task === "seg";
 
-  inputBuf = new Float32Array(1 * 3 * inputSize * inputSize);
-  prepCanvas = new OffscreenCanvas(inputSize, inputSize);
-  prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
+  if (isPose) {
+    poseInputBuf = new Float32Array(3 * poseW * poseH);
+    poseCanvas = new OffscreenCanvas(poseW, poseH);
+    poseCtx = poseCanvas.getContext("2d", { willReadFrequently: true });
+    // Reset detector so it (re)loads on the current EP; preload unless debug whole-frame.
+    detSession = null;
+    detLoadFailed = false;
+    if (poseMode !== "exclusive") await ensureDetector();
+    // 3D skeleton viewer — only for rtmw3d.
+    if (is3d) {
+      pose3dCanvas.style.display = "block";
+      pose3dControls.style.display = "flex";
+      if (!pose3dReady) {
+        initPose3d(pose3dCanvas);
+        // Manual grab takes over: reflect it in the auto-rotate checkbox.
+        onPose3dInteract(() => { autoRotateCb.checked = false; setAutoRotate(false); });
+        pose3dReady = true;
+      }
+      setPose3dRunning(true);
+    } else {
+      setPose3dRunning(false);
+      pose3dCanvas.style.display = "none";
+      pose3dControls.style.display = "none";
+    }
+  } else {
+    inputBuf = new Float32Array(1 * 3 * inputSize * inputSize);
+    prepCanvas = new OffscreenCanvas(inputSize, inputSize);
+    prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
+  }
 
-  const modelType = hasSegmentation ? "Seg" : "Det";
+  const modelType = isPose ? "Pose" : hasSegmentation ? "Seg" : "Det";
   badgeEl.textContent = activeBackend.toUpperCase();
   badgeEl.className = activeBackend;
-  statusEl.childNodes[0].textContent = `${meta.label} (${inputSize}px, ${modelType}) `;
+  const dims = isPose ? `${poseW}x${poseH}` : `${inputSize}px`;
+  statusEl.childNodes[0].textContent = `${meta.label} (${dims}, ${modelType}) `;
   startBtn.disabled = false;
   startBtnLarge.disabled = false;
   modelSelect.disabled = false;
@@ -822,6 +965,196 @@ function drawDetections(detections, w, h, masksData, maskDims) {
   }
 }
 
+// --- RTMW pose pipeline (top-down) ---
+
+// Lazy-load yolo26n as the optional person detector (V10 detector modes, C4).
+// Reuses the existing ONNX/EP path (V7) — same backend the pose model loaded on.
+async function ensureDetector() {
+  if (detSession) return true;
+  if (detLoadFailed) return false;   // already errored — don't refetch every frame
+  try {
+    // 640 is the canonical export; lower res served as inference_model_<res>.onnx.
+    const detUrl = `/models/yolo26n/inference_model${detRes === 640 ? "" : "_" + detRes}.onnx`;
+    const buf = await fetchModelWithProgress(detUrl);
+    hideProgress();
+    detSession = await ort.InferenceSession.create(buf, {
+      executionProviders: [activeBackend || "wasm"],
+      graphOptimizationLevel: "all",
+      enableCpuMemArena: true,
+      enableMemPattern: true,
+    });
+    detBuf = new Float32Array(3 * detRes * detRes);
+    detCanvas = new OffscreenCanvas(detRes, detRes);
+    detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
+    return true;
+  } catch (e) {
+    console.error("detector load failed:", e);
+    detLoadFailed = true;
+    statusEl.childNodes[0].textContent = `Person detector load failed: ${e.message}`;
+    return false;
+  }
+}
+
+// Run yolo26n, return person boxes in un-mirrored source px, score-sorted desc.
+async function detPersonBoxes(vidW, vidH) {
+  const R = detRes;
+  const a = performance.now();
+  detCtx.drawImage(video, 0, 0, R, R);
+  const d = detCtx.getImageData(0, 0, R, R).data;
+  const hw = R * R;
+  for (let i = 0; i < hw; i++) {
+    detBuf[i] = d[i * 4] / 255;
+    detBuf[hw + i] = d[i * 4 + 1] / 255;
+    detBuf[2 * hw + i] = d[i * 4 + 2] / 255;
+  }
+  const t = new ort.Tensor("float32", detBuf, [1, 3, R, R]);
+  const b = performance.now();
+  const out = await detSession.run({ images: t });
+  t.dispose();
+  const c = performance.now();
+  const o0 = out.output0;
+  const data = o0.data;
+  const stride = o0.dims[2];
+  const boxes = [];
+  for (let q = 0; q < data.length / stride; q++) {
+    const o = q * stride;
+    const score = data[o + 4];
+    if (score < threshold) break;                   // rows score-sorted desc → done
+    if (Math.round(data[o + 5]) !== 0) continue;    // YOLO person = class 0
+    const x1 = (data[o] / R) * vidW;
+    const y1 = (data[o + 1] / R) * vidH;
+    const x2 = (data[o + 2] / R) * vidW;
+    const y2 = (data[o + 3] / R) * vidH;
+    boxes.push({ x: x1, y: y1, w: x2 - x1, h: y2 - y1, score });
+  }
+  for (const k in out) out[k].dispose();
+  boxes.sort((a, b) => b.score - a.score);
+  poseProf.detPre = b - a; poseProf.detInf = c - b; poseProf.detPost = performance.now() - c;
+  return boxes;
+}
+
+// V2: bbox affine warp. Pad box to model aspect + padding 1.25, crop source into
+// the poseW×poseH input via an axis-aligned drawImage (RTMPose rotation=0, so the
+// affine is just scale+translate → invertible by the same rect). Normalize (V3).
+function posePreprocess(box) {
+  const cx = box.x + box.w / 2;
+  const cy = box.y + box.h / 2;
+  let w = box.w, h = box.h;
+  const aspect = poseW / poseH;
+  if (w > h * aspect) h = w / aspect; else w = h * aspect;
+  w *= POSE_PADDING; h *= POSE_PADDING;
+  const rect = { sx: cx - w / 2, sy: cy - h / 2, sw: w, sh: h };
+
+  // One op: crop the person box straight from the video AND scale to RTMW's exact
+  // input (poseW×poseH) — no full-frame copy, no second resize, tensor dims == model
+  // input (V1). drawImage ignores the CSS mirror, so this is un-mirrored model space (V6).
+  poseCtx.clearRect(0, 0, poseW, poseH);
+  poseCtx.drawImage(video, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, poseW, poseH);
+  const d = poseCtx.getImageData(0, 0, poseW, poseH).data;
+  const hw = poseW * poseH;
+  for (let i = 0; i < hw; i++) {
+    poseInputBuf[i] = (d[i * 4] - POSE_MEAN[0]) / POSE_STD[0];
+    poseInputBuf[hw + i] = (d[i * 4 + 1] - POSE_MEAN[1]) / POSE_STD[1];
+    poseInputBuf[2 * hw + i] = (d[i * 4 + 2] - POSE_MEAN[2]) / POSE_STD[2];
+  }
+  const tensor = new ort.Tensor("float32", poseInputBuf, [1, 3, poseH, poseW]);
+  return { tensor, rect };
+}
+
+// V4: SimCC decode. argmax per axis / split_ratio → model-input px, then invert
+// the crop rect → source-frame coords (V6). score = mean of the two axis maxima.
+function decodeSimcc(out, rect) {
+  const sx = out.simcc_x.data, sy = out.simcc_y.data;
+  const K = out.simcc_x.dims[1];
+  const Wx = out.simcc_x.dims[2];
+  const Hy = out.simcc_y.dims[2];
+  const rX = Wx / poseW, rY = Hy / poseH;   // split_ratio ≈ 2
+  const kpts = new Array(K);
+  for (let k = 0; k < K; k++) {
+    let bx = 0, bvx = -Infinity;
+    const ox = k * Wx;
+    for (let i = 0; i < Wx; i++) { const v = sx[ox + i]; if (v > bvx) { bvx = v; bx = i; } }
+    let by = 0, bvy = -Infinity;
+    const oy = k * Hy;
+    for (let i = 0; i < Hy; i++) { const v = sy[oy + i]; if (v > bvy) { bvy = v; by = i; } }
+    const mx = bx / rX, my = by / rY;       // model-input px
+    kpts[k] = {
+      x: rect.sx + (mx / poseW) * rect.sw,
+      y: rect.sy + (my / poseH) * rect.sh,
+      score: 0.5 * (bvx + bvy),
+    };
+  }
+  return kpts;
+}
+
+// RTMW3D: 3-axis SimCC (V15/V16). output=X[576], "1554"=Y[768], "1556"=Z[576].
+// Returns 2D keypoints (source-frame px, for the overlay) + 3D (model px incl depth).
+function decode3d(out, rect) {
+  const sx = out.output.data, sy = out["1554"].data, sz = out["1556"].data;
+  const K = out.output.dims[1];
+  const Wx = out.output.dims[2], Hy = out["1554"].dims[2], Wz = out["1556"].dims[2];
+  const rX = Wx / poseW, rY = Hy / poseH, rZ = Wz / poseW;   // split_ratio ≈ 2
+  const k2d = new Array(K), k3d = new Array(K);
+  for (let k = 0; k < K; k++) {
+    let bx = 0, vx = -1e9; const ox = k * Wx; for (let i = 0; i < Wx; i++) { const v = sx[ox + i]; if (v > vx) { vx = v; bx = i; } }
+    let by = 0, vy = -1e9; const oy = k * Hy; for (let i = 0; i < Hy; i++) { const v = sy[oy + i]; if (v > vy) { vy = v; by = i; } }
+    let bz = 0; const oz = k * Wz; let vz = -1e9; for (let i = 0; i < Wz; i++) { const v = sz[oz + i]; if (v > vz) { vz = v; bz = i; } }
+    const mx = bx / rX, my = by / rY, mz = bz / rZ;          // model-input px (x,y) + depth px (z, 0..poseW)
+    const score = 0.5 * (vx + vy);                            // z maxima low; gate on x,y only
+    k2d[k] = { x: rect.sx + (mx / poseW) * rect.sw, y: rect.sy + (my / poseH) * rect.sh, score };
+    // 3D in a consistent normalized space (V16): x,y ÷ (poseH/2) keep aspect; z gets the
+    // RTMPose3d transform (z_px → root-relative depth × z_range), else depth looks flat.
+    k3d[k] = {
+      x: mx / (poseH / 2),
+      y: my / (poseH / 2),
+      z: (mz / (poseW / 2) - 1) * Z_RANGE,
+      score,
+    };
+  }
+  return { k2d, k3d };
+}
+
+function groupOn(key) {
+  if (key === "body") return showBody;
+  if (key === "face") return showFace;
+  return showHands;   // lhand / rhand
+}
+
+// V11/V12/V13: joints (circles) + bones (lines), per-group colour, size scaled to
+// the person box. Mirror x to match the CSS-flipped video (V6).
+function drawPose(persons, vidW, vidH) {
+  ctx.clearRect(0, 0, vidW, vidH);
+  if (!poseOverlayOn) return;
+  for (const p of persons) {
+    const kpts = p.kpts;
+    const r = Math.max(2, Math.min(8, Math.round((p.box.h || vidH) / 110)));
+    const lw = Math.max(1.5, r * 0.7);
+    for (const g of POSE_GROUPS) {
+      if (!groupOn(g.key)) continue;
+      ctx.strokeStyle = g.color;
+      ctx.lineWidth = lw;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      for (const [a, b] of g.edges) {
+        const ka = kpts[a], kb = kpts[b];
+        if (!ka || !kb || ka.score < kptThresh || kb.score < kptThresh) continue;
+        ctx.moveTo(vidW - ka.x, ka.y);
+        ctx.lineTo(vidW - kb.x, kb.y);
+      }
+      ctx.stroke();
+      ctx.fillStyle = g.color;
+      const rr = g.key === "face" ? Math.max(1.2, r * 0.45) : r;
+      for (let i = g.lo; i < g.hi; i++) {
+        const k = kpts[i];
+        if (!k || k.score < kptThresh) continue;
+        ctx.beginPath();
+        ctx.arc(vidW - k.x, k.y, rr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
 // --- Sidebar segments ---
 
 function updateSidebar(detections, masksData, maskDims, vidW, vidH) {
@@ -973,8 +1306,47 @@ async function detectLoop() {
   let detections, masksData = null, maskDims = null;
   let tPreprocess, tInference, tPostprocess;
   let bridgeServer = null, bridgeSpeed = null;
+  let posePersons = null;
 
-  if (usingBridge) {
+  const isPoseFam = family === "rtmw" || family === "rtmw3d";
+
+  if (isPoseFam) {
+    // Top-down: pick person box(es), crop each straight from video at the model's
+    // exact input res, run RTMW, decode keypoints. Exclusive = whole frame (V10).
+    let boxes;
+    if (poseMode === "exclusive") {
+      boxes = [{ x: 0, y: 0, w: vidW, h: vidH }];   // DEBUG only: whole frame, no detector
+    } else if (await ensureDetector()) {
+      boxes = await detPersonBoxes(vidW, vidH);     // top-down: tight person crops (default)
+      if (poseMode === "single") boxes = boxes.slice(0, 1);
+      else if (poseMode.startsWith("cap")) boxes = boxes.slice(0, parseInt(poseMode.slice(3), 10));
+    } else {
+      boxes = [];   // detector required but failed to load — error shown, draw nothing
+    }
+    tPreprocess = performance.now();
+
+    posePersons = [];
+    let pPre = 0, pInf = 0, pPost = 0;
+    for (const box of boxes) {
+      const a = performance.now();
+      const { tensor, rect } = posePreprocess(box);
+      const b = performance.now();
+      const out = await session.run({ input: tensor });
+      tensor.dispose();
+      const c = performance.now();
+      let kpts, kpts3d = null;
+      if (family === "rtmw3d") { const d = decode3d(out, rect); kpts = d.k2d; kpts3d = d.k3d; }
+      else kpts = decodeSimcc(out, rect);
+      posePersons.push({ kpts, kpts3d, box });
+      for (const k in out) out[k].dispose();
+      pPre += b - a; pInf += c - b; pPost += performance.now() - c;
+    }
+    poseProf.posePre = pPre; poseProf.poseInf = pInf; poseProf.posePost = pPost;
+    poseProf.nppl = boxes.length;
+    tInference = performance.now();
+    tPostprocess = tInference;
+    detections = posePersons;
+  } else if (usingBridge) {
     // Native Python inference over the WebSocket. Send the frame, await decoded
     // dets + masks (same shape as the ONNX path), draw with the shared code.
     prepCtx.drawImage(video, 0, 0, inputSize, inputSize);
@@ -1031,7 +1403,13 @@ async function detectLoop() {
     tPostprocess = performance.now();
   }
 
-  if (cutoutMode) {
+  if (isPoseFam) {
+    drawPose(posePersons, vidW, vidH);
+    if (family === "rtmw3d") {
+      const groups = POSE_GROUPS.map(g => ({ lo: g.lo, hi: g.hi, color: g.color, edges: g.edges, enabled: groupOn(g.key) }));
+      updatePose3d(posePersons, { groups, kptThresh, depthScale });
+    }
+  } else if (cutoutMode) {
     drawCutout(detections, masksData, maskDims, vidW, vidH);
   } else {
     drawDetections(detections, vidW, vidH, masksData, maskDims);
@@ -1040,12 +1418,12 @@ async function detectLoop() {
 
   let tSidebar = tDraw;
   frameCount++;
-  if (showSegments && !cutoutMode && frameCount % 3 === 0) {
+  if (showSegments && !cutoutMode && !isPoseFam && frameCount % 3 === 0) {
     updateSidebar(detections, masksData, maskDims, vidW, vidH);
     tSidebar = performance.now();
   }
 
-  const mode = hasSegmentation ? "seg" : "det";
+  const mode = isPoseFam ? (family === "rtmw3d" ? "pose3d" : "pose") : hasSegmentation ? "seg" : "det";
   // Rolling median per stage (n=60) — same as the python cam HUD, so the two
   // are directly comparable instead of reading jittery instantaneous values.
   const stat = {
@@ -1077,7 +1455,7 @@ async function detectLoop() {
     `post:${m.post.toFixed(1)}`,
     `draw:${m.draw.toFixed(1)}`,
     `total:${m.total.toFixed(1)}ms (${(1000 / m.total).toFixed(0)}fps)`,
-    `${detections.length}obj ${mode} ${inputSize}px ${family}`,
+    `${detections.length}${isPoseFam ? "ppl" : "obj"} ${mode} ${isPoseFam ? `${poseW}x${poseH}` : inputSize + "px"} ${family}`,
   ];
   if (usingBridge && bridgeServer) {
     base.push(

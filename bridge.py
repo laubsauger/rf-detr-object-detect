@@ -27,18 +27,22 @@ import numpy as np
 import websockets
 
 import models
+from instant_hmr import MeshModel, encode_mesh
+from setup_instanthmr import validate_fit
 
 MASK_RES = 160  # mask grid sent to the browser (it upscales on the canvas)
 
 _cache = {}
 
 
-def get_model(model_id):
-    if model_id not in _cache:
+def get_model(model_id, device="cpu", fit=1, mesh_options=None):
+    is_mesh = model_id.startswith("instanthmr-")
+    key = (model_id, device, validate_fit(fit)) if is_mesh else model_id
+    if key not in _cache:
         print(f"[bridge] loading {model_id} ...")
-        _cache[model_id] = models.build(model_id)
-        print(f"[bridge] ready {model_id} ({_cache[model_id].backend}/{_cache[model_id].device})")
-    return _cache[model_id]
+        _cache[key] = MeshModel(model_id, device, fit) if is_mesh else models.build(model_id)
+        print(f"[bridge] ready {model_id} ({_cache[key].backend}/{_cache[key].device})")
+    return _cache[key].for_session(mesh_options if mesh_options is not None else {}) if is_mesh else _cache[key]
 
 
 def encode(boxes_norm, scores, classes, masks, mh, mw, seg, speed, server):
@@ -137,16 +141,35 @@ async def handler(ws):
         if isinstance(msg, str):
             req = json.loads(msg)
             if req.get("type") == "model":
-                model = get_model(req["id"])
+                model = None
+                try:
+                    model = get_model(req["id"], req.get("device", "cpu"), req.get("fit", 1),
+                                      req.get("meshOptions", {}))
+                except Exception as exc:
+                    await ws.send(json.dumps({"type": "error", "message": str(exc)}))
+                    continue
                 threshold = float(req.get("threshold", 0.5))
+                matte = False
                 await ws.send(json.dumps({
                     "type": "ready", "id": model.model_id, "family": model.family,
                     "task": model.task, "backend": model.backend, "device": model.device,
+                    **(model.metadata() if model.task == "mesh" else {}),
                 }))
             elif req.get("type") == "threshold":
                 threshold = float(req["value"])
             elif req.get("type") == "matte":
-                matte = bool(req["value"])   # person-union mask only
+                matte = bool(req["value"]) and model is not None and model.task == "seg"
+            elif req.get("type") == "mesh-options":
+                try:
+                    if model is None or model.task != "mesh":
+                        raise ValueError("Select an InstantHMR model before configuring smoothing")
+                    if req.get("reset"):
+                        model.reset_tracking()
+                    else:
+                        model.configure(req["options"])
+                    await ws.send(json.dumps({"type": "mesh-configured", "options": model.options}))
+                except Exception as exc:
+                    await ws.send(json.dumps({"type": "error", "request": "mesh-options", "message": str(exc)}))
             continue
 
         # binary frame
@@ -158,7 +181,16 @@ async def handler(ws):
         ch = msg[4]
         frame = np.frombuffer(msg, dtype=np.uint8, offset=5).reshape(h, w, ch)
         t1 = time.perf_counter()
-        if matte:
+        if model.task == "mesh":
+            try:
+                persons, timings = model.predict_mesh(frame[:, :, :3], threshold)
+                server = {"parse": round((t1 - t0) * 1000, 2),
+                          "predict": round((time.perf_counter() - t1) * 1000, 2), **timings}
+                out = encode_mesh(persons, w, h, server)
+            except Exception as exc:
+                await ws.send(json.dumps({"type": "error", "message": str(exc)}))
+                continue
+        elif matte:
             union, mh, mw = run_matte(model, frame, threshold)
             server = {"parse": round((t1 - t0) * 1000, 2),
                       "predict": round((time.perf_counter() - t1) * 1000, 2)}

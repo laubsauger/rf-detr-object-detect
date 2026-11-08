@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RF-DETR Object Detection</title>
+  <title>Vision Model Lab</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { height: 100%; overflow: hidden; }
@@ -16,6 +16,9 @@
     #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; object-fit: contain; }
     #stats { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.75); padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; font-variant-numeric: tabular-nums; z-index: 2; color: #eee; }
     #pose3d { position: absolute; bottom: 8px; right: 8px; width: 300px; height: 360px; z-index: 6; border: 1px solid #333; border-radius: 8px; background: #0a0a0f; display: none; cursor: grab; touch-action: none; }
+
+    #pose3d.mesh { width: min(420px, 48vw); height: min(520px, 68vh); }
+    #control-panel { max-height: calc(100% - 16px); overflow-y: auto; }
 
     /* Floating control panel */
     #panel-toggle { position: absolute; top: 8px; left: 8px; z-index: 20; width: 32px; height: 32px; border: 1px solid #555; background: rgba(0,0,0,0.6); color: #eee; border-radius: 6px; cursor: pointer; font-size: 1.1rem; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(8px); }
@@ -82,7 +85,7 @@
       <button id="panel-toggle" title="Settings">&#x2699;</button>
       <div id="control-panel">
         <div class="panel-header">
-          <h2>RF-DETR</h2>
+          <h2>Vision Model Lab</h2>
           <button class="panel-close" id="panelClose" title="Close">&times;</button>
         </div>
         <div class="status-line" id="status">Loading...<span id="backend-badge"></span></div>
@@ -94,6 +97,7 @@
           <option value="wasm">WASM</option>
           <option value="python-mps">Python · torch/MPS</option>
           <option value="python-mlx">Python · MLX</option>
+          <option value="python-hmr">Python · InstantHMR</option>
         </select></label>
         <button id="startBtn" disabled>Start Camera</button>
 
@@ -126,12 +130,49 @@
           <label><input type="checkbox" id="showHands" checked> Hands</label>
           <label><input type="checkbox" id="showFace" checked> Face</label>
           <label><input type="checkbox" id="poseOverlay" checked> Overlay on</label>
-          <div id="pose3d-controls" style="display:none; flex-direction:column; gap:6px; border-top:1px solid #222; padding-top:6px;">
-            <div class="ctrl-row"><span>Depth</span><input type="range" id="depthScale" min="0.5" max="4" step="0.1" value="1.5"><span class="ctrl-val" id="depthScaleVal">1.5×</span></div>
-            <label><input type="checkbox" id="autoRotate" checked> Auto-rotate 3D</label>
-            <button id="resetView">Reset 3D view</button>
-            <div class="status-line">drag rotate · right-drag pan · wheel zoom</div>
+
+        </div>
+
+        <div class="ctrl-group" id="mesh-controls" style="display:none;">
+          <label>Mesh device <select id="meshDevice">
+            <option value="cpu">ONNX · CPU</option>
+            <option value="coreml">ONNX · CoreML (Mac)</option>
+            <option value="cuda">ONNX · CUDA (NVIDIA)</option>
+          </select></label>
+          <label>Smoothing <select id="meshSmoothing">
+            <option value="one-euro" selected>Pose · One Euro</option>
+            <option value="alpha-beta">Pose · alpha-beta</option>
+            <option value="output">Output · One Euro (stronger)</option>
+            <option value="off">Off · raw prediction</option>
+          </select></label>
+          <div class="status-line" id="mesh-smoothing-help">Filters body angles before building the mesh; keeps pose and mesh consistent.</div>
+          <div id="mesh-response-control" style="display:none;">
+            <div class="ctrl-row"><span>Response</span><input type="range" id="meshResponse" min="0.25" max="4" step="0.25" value="1"><span class="ctrl-val" id="meshResponseVal">1.00×</span></div>
+            <div class="status-line">Lower: steadier · higher: less motion lag</div>
           </div>
+          <label>Fit quality <select id="meshFit">
+            <option value="0">Off · network only</option>
+            <option value="1" selected>1 crop · faster fit</option>
+            <option value="2">2 crops · higher accuracy</option>
+          </select></label>
+          <div class="status-line">Changing fit loads another model graph.</div>
+          <label>People <select id="meshMaxPersons">
+            <option value="1">1 · fastest</option>
+            <option value="2">Up to 2</option>
+            <option value="3">Up to 3</option>
+            <option value="4" selected>Up to 4</option>
+          </select></label>
+          <button id="resetMeshTracking">Reset smoothing history</button>
+          <label><input type="checkbox" id="meshOverlay" checked> Show 70 keypoints</label>
+          <label><input type="checkbox" id="meshWireframe"> Wireframe mesh</label>
+          <button id="downloadMesh" disabled>Download mesh (.obj)</button>
+          <div class="status-line" id="mesh-info">YOLO26n → InstantHMR · up to 4 people</div>
+        </div>
+        <div id="pose3d-controls" style="display:none; flex-direction:column; gap:6px; border-top:1px solid #222; padding-top:6px;">
+          <div class="ctrl-row" id="depth-control"><span>Depth</span><input type="range" id="depthScale" min="0.5" max="4" step="0.1" value="1.5"><span class="ctrl-val" id="depthScaleVal">1.5×</span></div>
+          <label><input type="checkbox" id="autoRotate" checked> Auto-rotate 3D</label>
+          <button id="resetView">Reset 3D view</button>
+          <div class="status-line">drag rotate · right-drag pan · wheel zoom</div>
         </div>
 
         <div class="ctrl-group">

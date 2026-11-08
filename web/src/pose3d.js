@@ -11,7 +11,10 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 const VIEW = 1.6;        // normalized coords → world units
 const PERSON_GAP = 1.8;  // x-offset between multiple people
 
-let renderer, scene, camera, group, points, lines, controls;
+let renderer, scene, camera, group, points, lines, controls, meshGroup;
+let meshMode = false;
+let wireframe = false;
+let meshNeedsFit = true;
 let latest = { persons: [], opts: null };
 let running = false, raf = 0;
 let onGrab = null;       // callback when user starts interacting (to flip UI off auto)
@@ -50,6 +53,12 @@ export function initPose3d(canvas) {
 
   group = new THREE.Group();
   scene.add(group);
+  meshGroup = new THREE.Group();
+  scene.add(meshGroup);
+  scene.add(new THREE.HemisphereLight(0xd9ecff, 0x374151, 2.5));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 3);
+  keyLight.position.set(2, 4, 5);
+  scene.add(keyLight);
 
   const grid = new THREE.GridHelper(6, 12, 0x335577, 0x223344);
   grid.position.y = -2.2;
@@ -64,6 +73,13 @@ export function initPose3d(canvas) {
     new THREE.LineBasicMaterial({ vertexColors: true })
   );
   group.add(points, lines);
+  new ResizeObserver(() => {
+    const { clientWidth: width, clientHeight: height } = canvas;
+    if (!width || !height) return;
+    renderer.setSize(width, height, false);
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+  }).observe(canvas);
 }
 
 function rebuild() {
@@ -105,13 +121,78 @@ function rebuild() {
 function loop() {
   if (!running) return;
   raf = requestAnimationFrame(loop);
-  rebuild();
+  if (!meshMode) rebuild();
   controls.update();           // damping + auto-rotate
   renderer.render(scene, camera);
 }
 
 export function updatePose3d(persons, opts) {
+  if (meshMode) {
+    controls.target.set(0, 0, 0);
+    camera.position.set(0, 0, 6);
+    controls.update();
+    controls.saveState();
+  }
+  meshMode = false;
+  if (meshGroup) meshGroup.visible = false;
+  if (points) { points.visible = true; lines.visible = true; }
   latest = { persons, opts };
+}
+
+// Camera-space metres -> right-handed world, without reflecting the mesh.
+// Rotate 180 degrees about X: image-down becomes up, forward becomes -Z.
+export function updateMesh3d(persons, faces) {
+  meshMode = true;
+  points.visible = lines.visible = false;
+  meshGroup.visible = true;
+  if (!persons.length) meshNeedsFit = true;
+  while (meshGroup.children.length > persons.length) {
+    const mesh = meshGroup.children[meshGroup.children.length - 1];
+    meshGroup.remove(mesh);
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+  }
+  persons.forEach((p, i) => {
+    let mesh = meshGroup.children[i];
+    if (!mesh) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setIndex(new THREE.BufferAttribute(faces, 1));
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(p.vertices.length), 3));
+      mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+        color: new THREE.Color().setHSL((0.52 + i * 0.17) % 1, 0.65, 0.6),
+        roughness: 0.65, metalness: 0.1, side: THREE.DoubleSide, wireframe,
+      }));
+      mesh.rotation.x = Math.PI;
+      meshGroup.add(mesh);
+    }
+    mesh.geometry.attributes.position.array.set(p.vertices);
+    mesh.geometry.attributes.position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+    mesh.geometry.computeBoundingSphere();
+  });
+  if (persons.length) {
+    const bounds = new THREE.Box3().setFromObject(meshGroup);
+    const center = bounds.getCenter(new THREE.Vector3());
+    // Center the scene using one shared translation; retain relative positions.
+    meshGroup.position.sub(center);
+    if (meshNeedsFit) {
+      // Fit the full group using the narrower field of view (portrait canvas).
+      const radius = bounds.getBoundingSphere(new THREE.Sphere()).radius;
+      const vertical = THREE.MathUtils.degToRad(camera.fov / 2);
+      const horizontal = Math.atan(Math.tan(vertical) * camera.aspect);
+      const distance = radius / Math.sin(Math.min(vertical, horizontal)) * 1.1;
+      controls.target.set(0, 0, 0);
+      camera.position.set(0, 0, distance);
+      controls.update();
+      controls.saveState();
+      meshNeedsFit = false;
+    }
+  }
+}
+
+export function setMeshWireframe(on) {
+  wireframe = on;
+  if (meshGroup) for (const mesh of meshGroup.children) mesh.material.wireframe = on;
 }
 
 export function setPose3dRunning(on) {

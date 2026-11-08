@@ -261,6 +261,91 @@ reading raw model speed.
 
 ---
 
+## 5. InstantHMR: live 3D body meshes
+
+The dashboard also supports [InstantHMR](https://github.com/Naturalpad-studio/InstantHMR)
+through the existing Python bridge. It uses our YOLO26n detector to find up to
+four people, then runs the InstantHMR ONNX network and the MHR body graph.
+Each person has 70 keypoints and an 18,439-vertex mesh.
+
+One-time setup (Python 3.10–3.12; use the existing project venv):
+
+```bash
+source venv/bin/activate
+pip install -r requirements-instanthmr.txt
+python setup_instanthmr.py
+```
+
+Setup downloads the upstream runtime and licences into ignored
+`vendor/InstantHMR/`, and caches ONNX weights in the Hugging Face cache.
+The source revision and weight revision are pinned in `setup_instanthmr.py`.
+It does not install the upstream Rerun demo or run any Git commands.
+
+```bash
+python bridge.py
+# separate terminal:
+cd web && npm run dev
+```
+
+Select **InstantHMR medium-commercial · mesh**, then **Start Camera**. The
+dashboard selects **Python · InstantHMR** automatically. The **Mesh device**
+control explicitly selects CPU, CoreML (Mac), or CUDA (NVIDIA); unavailable
+providers produce an error. CPU is the initial selection. CoreML may partition
+unsupported ONNX operations onto CPU, as in upstream; the body graph uses CPU
+on Mac. CUDA requires the GPU ONNX Runtime package installed by the optional
+requirements file on Linux/Windows.
+
+Drag the shaded 3D view to orbit, use **Wireframe mesh**, or download the current
+frame as an **OBJ** (all people, triangle faces, camera-space metres: X right,
+Y down, Z forward). The viewer rotates the coordinate axes for an upright
+display and centers the group, preserving relative positions. The 2D overlay
+matches the mirrored webcam; the 3D scene and export preserve body handedness.
+Timing shows detector and HMR + mesh separately. Frames preserve their aspect
+ratio and are capped at 640 pixels on the long side before transport. Background
+cutout and segment controls are disabled for mesh models.
+
+The mesh controls also expose:
+
+- **Smoothing:** upstream's **Pose · One Euro** preset is on by default. It
+  filters body angles before mesh generation; the 2D keypoints and camera
+  translation remain raw. **Pose · alpha-beta** is the other upstream preset.
+  **Off** provides an unsmoothed comparison.
+- **Output · One Euro:** smooths the resulting 2D/3D keypoints, vertices and
+  camera translation instead. Its **Response** slider scales upstream's beta
+  values from 0.25× to 4× (default 1×). Lower is steadier; higher follows motion
+  faster. This mode can introduce lag and does not preserve the exact pose/body
+  relationship in the way pose filtering does. Pose and output filters are
+  mutually exclusive.
+- **Fit quality:** off (network only), one crop (default, faster), or two crops
+  (higher accuracy). Changing fit loads a different ONNX graph; each downloads
+  once. Prefetch with `python setup_instanthmr.py --fit 2`.
+- **People:** cap inference at 1–4 people. Use one for a faster single-person
+  webcam test. The confidence slider remains the detector threshold.
+- **Reset smoothing history:** clears temporal state without reloading the
+  network. Changing smoothing/response/person limit also clears history. Filter
+  state belongs to each WebSocket, resets on camera restart, and ages out after
+  six missed inference frames. Filters use actual monotonic frame timestamps,
+  rather than assuming a 30 fps inference rate.
+
+Smoothing, response, and person limit changes apply live without downloading or
+reloading model weights. Pose filters use the pinned upstream coefficients:
+One Euro cutoff 12 Hz, beta 0.5, derivative cutoff 1 Hz; alpha-beta alpha 0.8,
+beta 0.005. Their internal coefficients are kept as presets.
+
+The default weights are `medium-commercial`. The other four model choices are
+marked **non-commercial**, matching the upstream model licences. Each variant
+downloads on first use; prefetch another with
+`python setup_instanthmr.py --model small`. Weights remain subject to the
+[upstream SAM licence](https://github.com/Naturalpad-studio/InstantHMR/blob/main/LICENSE-SAM).
+
+Focused checks with the optional integration installed (no weights, camera, or
+GPU used):
+
+```bash
+venv/bin/python -m unittest test_instant_hmr.py
+node --test web/src/mesh.test.js
+```
+
 ## Dependencies
 
 - **Python** (`requirements.txt`): rfdetr, ultralytics, supervision,

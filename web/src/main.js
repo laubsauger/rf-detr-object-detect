@@ -1,6 +1,7 @@
 import * as ort from "onnxruntime-web";
 import { createBridge, decodeBridgeResult } from "./bridge.js";
-import { initPose3d, updatePose3d, setPose3dRunning, setAutoRotate, resetView, onPose3dInteract } from "./pose3d.js";
+import { initPose3d, updatePose3d, updateMesh3d, setMeshWireframe, setPose3dRunning, setAutoRotate, resetView, onPose3dInteract } from "./pose3d.js";
+import { MESH_MODELS, drawMeshOverlay, meshToObj } from "./mesh.js";
 
 ort.env.logLevel = "error";
 ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
@@ -162,6 +163,21 @@ const resetViewBtn = document.getElementById("resetView");
 const depthScaleInput = document.getElementById("depthScale");
 const depthScaleVal = document.getElementById("depthScaleVal");
 let pose3dReady = false;   // three.js scene initialized lazily on first 3D model load
+const meshControls = document.getElementById("mesh-controls");
+const meshDevice = document.getElementById("meshDevice");
+const meshOverlay = document.getElementById("meshOverlay");
+const meshWireframe = document.getElementById("meshWireframe");
+const downloadMesh = document.getElementById("downloadMesh");
+const meshInfo = document.getElementById("mesh-info");
+const meshSmoothing = document.getElementById("meshSmoothing");
+const meshResponse = document.getElementById("meshResponse");
+const meshResponseVal = document.getElementById("meshResponseVal");
+const meshFit = document.getElementById("meshFit");
+const meshMaxPersons = document.getElementById("meshMaxPersons");
+const resetMeshTracking = document.getElementById("resetMeshTracking");
+const meshTuningControls = [meshSmoothing, meshResponse, meshFit, meshMaxPersons, resetMeshTracking];
+let meshFaces = null, meshEdges = [], meshPersons = [];
+let frameInFlight = null;
 
 // State
 let session = null;
@@ -362,6 +378,52 @@ detResSelect.addEventListener("change", () => {
 });
 
 // 3D viewer orbit controls
+meshDevice.addEventListener("change", () => loadModel(currentModelId));
+meshFit.addEventListener("change", () => loadModel(currentModelId));
+function readMeshOptions() {
+  return { smoothing: meshSmoothing.value, betaScale: Number(meshResponse.value), maxPersons: Number(meshMaxPersons.value) };
+}
+function syncMeshSmoothingHelp() {
+  const output = meshSmoothing.value === "output";
+  document.getElementById("mesh-response-control").style.display = output ? "" : "none";
+  document.getElementById("mesh-smoothing-help").textContent = output
+    ? "Smooths keypoints, mesh and camera translation. Stronger stabilization can lag fast motion."
+    : meshSmoothing.value === "off" ? "Raw frame-by-frame predictions; useful for comparing jitter."
+    : "Filters body angles before building the mesh; keeps pose and mesh consistent.";
+}
+function updateMeshInfo() {
+  const m = bridge.meta;
+  meshInfo.textContent = `${m.detector} → HMR fit ${m.fit} · ${m.meshOptions.smoothing} · up to ${m.meshOptions.maxPersons} people`;
+}
+async function configureMesh(reset = false) {
+  meshTuningControls.forEach(control => { control.disabled = true; });
+  modelSelect.disabled = backendSelect.disabled = meshDevice.disabled = true;
+  try {
+    await bridge.configureMesh(readMeshOptions(), reset);
+    statHist = [];
+    updateMeshInfo();
+  } catch (error) {
+    statusEl.childNodes[0].textContent = error.message;
+  } finally {
+    meshTuningControls.forEach(control => { control.disabled = false; });
+    modelSelect.disabled = backendSelect.disabled = meshDevice.disabled = false;
+  }
+}
+meshSmoothing.addEventListener("change", () => { syncMeshSmoothingHelp(); configureMesh(); });
+meshMaxPersons.addEventListener("change", () => configureMesh());
+meshResponse.addEventListener("input", () => { meshResponseVal.textContent = Number(meshResponse.value).toFixed(2) + "×"; });
+meshResponse.addEventListener("change", () => configureMesh());
+resetMeshTracking.addEventListener("click", () => configureMesh(true));
+meshWireframe.addEventListener("change", () => setMeshWireframe(meshWireframe.checked));
+downloadMesh.addEventListener("click", () => {
+  if (!meshPersons.length) return;
+  const url = URL.createObjectURL(new Blob([meshToObj(meshPersons, meshFaces)], { type: "text/plain" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${currentModelId}.obj`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 autoRotateCb.addEventListener("change", () => setAutoRotate(autoRotateCb.checked));
 resetViewBtn.addEventListener("click", () => { resetView(); autoRotateCb.checked = true; });
 depthScaleInput.addEventListener("input", () => {
@@ -403,138 +465,181 @@ document.addEventListener("fullscreenchange", () => {
 
 // --- Model loading ---
 
+function show3dViewer(mesh = false) {
+  pose3dCanvas.classList.toggle("mesh", mesh);
+  pose3dCanvas.style.display = "block";
+  pose3dControls.style.display = "flex";
+  document.getElementById("depth-control").style.display = mesh ? "none" : "";
+  if (!pose3dReady) {
+    initPose3d(pose3dCanvas);
+    onPose3dInteract(() => { autoRotateCb.checked = false; setAutoRotate(false); });
+    pose3dReady = true;
+  }
+  if (!mesh) updatePose3d([], null);
+  setAutoRotate(autoRotateCb.checked);
+  setPose3dRunning(true);
+}
+
 async function loadModel(modelId) {
   if (loading) return;
   loading = true;
   modelSelect.disabled = true;
   startBtn.disabled = true;
   startBtnLarge.disabled = true;
-  currentModelId = modelId;
-
-  const meta = manifest.find(m => m.id === modelId);
-  family = meta.family || "rfdetr";
-  const is3d = family === "rtmw3d";
-  const isPose = family === "rtmw" || is3d;
-  if (isPose) { poseW = meta.resW; poseH = meta.resH; inputSize = meta.resW; }
-  else { inputSize = meta.resolution; }
-  inputName = family === "yolo" ? "images" : "input";
-  activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
-  activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
-  // Pose controls only apply to the rtmw family.
-  poseControls.style.display = isPose ? "" : "none";
-
-  const preferredBackend = backendSelect.value;
-
-  // RTMW runs in-browser only — no pose model on the python bridge server.
-  if (isPose && preferredBackend.startsWith("python")) {
-    statusEl.childNodes[0].textContent = "RTMW pose runs in-browser — pick WebGPU or WASM.";
-    loading = false;
-    modelSelect.disabled = false;
-    return;
-  }
-
-  // --- Python bridge backend (native MPS / MLX over WebSocket) ---
-  if (preferredBackend.startsWith("python")) {
-    const ok = await loadBridgeModel(modelId, meta, preferredBackend);
-    loading = false;
-    modelSelect.disabled = false;
-    if (ok) { startBtn.disabled = false; startBtnLarge.disabled = false; }
-    return;
-  }
-  if (bridge) { bridge.close(); bridge = null; usingBridge = false; }
-
-  // RTMW (2D) fp16 variant keeps fp32 IO, so decode/preprocess are unchanged.
-  // rtmw3d has no fp16 variant — always fp32.
-  const fileName = (family === "rtmw" && posePrecision === "fp16") ? "inference_model_fp16.onnx" : "inference_model.onnx";
-  const modelUrl = `/models/${modelId}/${fileName}`;
-  const backends = preferredBackend === "auto"
-    ? ["webgpu", "wasm"]
-    : [preferredBackend];
-
-  session = null;
-  activeBackend = null;
-
-  // Download model with progress (cached after first download)
-  let modelData;
+  backendSelect.disabled = true;
+  meshDevice.disabled = true;
+  meshTuningControls.forEach(control => { control.disabled = true; });
   try {
-    statusEl.childNodes[0].textContent = `Downloading ${meta.label}...`;
-    modelData = await fetchModelWithProgress(modelUrl);
-    hideProgress();
-  } catch (e) {
-    console.error("Model download error:", e);
-    statusEl.childNodes[0].textContent = e.message.includes("not found")
-      ? `Model not found — run export_onnx.py or copy .onnx files to web/public/models/`
-      : `Download failed: ${e.message}`;
-    hideProgress();
-    loading = false;
-    modelSelect.disabled = false;
-    return;
-  }
+    await frameInFlight;
+    if (bridge) { bridge.close(); bridge = null; }
+    usingBridge = false;
+    session = null;
+    setPose3dRunning(false);
+    pose3dCanvas.style.display = "none";
+    pose3dControls.style.display = "none";
+    meshPersons = [];
+    downloadMesh.disabled = true;
+    currentModelId = modelId;
 
-  for (const backend of backends) {
+    const meta = manifest.find(m => m.id === modelId);
+    family = meta.family || "rfdetr";
+    const is3d = family === "rtmw3d";
+    const isPose = family === "rtmw" || is3d;
+    const isMesh = family === "instanthmr";
+    if (isPose) { poseW = meta.resW; poseH = meta.resH; inputSize = meta.resW; }
+    else { inputSize = meta.resolution; }
+    inputName = family === "yolo" ? "images" : "input";
+    activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
+    activeColors = family === "yolo" ? YOLO_COLORS : COLORS;
+    // Pose controls only apply to the rtmw family.
+    poseControls.style.display = isPose ? "" : "none";
+    meshControls.style.display = isMesh ? "" : "none";
+    maskOpacityInput.parentElement.style.display = isMesh ? "none" : "";
+    outlineOpacityInput.parentElement.style.display = isMesh ? "none" : "";
+    for (const option of backendSelect.options) {
+      option.disabled = isMesh ? option.value !== "python-hmr" : option.value === "python-hmr";
+    }
+    if (isMesh) backendSelect.value = "python-hmr";
+    else if (backendSelect.value === "python-hmr") backendSelect.value = "auto";
+    cutoutCheckbox.disabled = showSegmentsCheckbox.disabled = isMesh;
+    if (isMesh) {
+      cutoutMode = cutoutCheckbox.checked = false;
+      showSegments = showSegmentsCheckbox.checked = false;
+      segmentPane.classList.remove("visible");
+      video.style.opacity = "1";
+      videoPane.style.background = "";
+    }
+    const preferredBackend = backendSelect.value;
+
+    // RTMW runs in-browser only — no pose model on the python bridge server.
+    if (isPose && preferredBackend.startsWith("python")) {
+      statusEl.childNodes[0].textContent = "RTMW pose runs in-browser — pick WebGPU or WASM.";
+      loading = false;
+      modelSelect.disabled = false;
+      return;
+    }
+
+    // --- Python bridge backend (native MPS / MLX over WebSocket) ---
+    if (preferredBackend.startsWith("python")) {
+      const ok = await loadBridgeModel(modelId, meta, preferredBackend);
+      loading = false;
+      modelSelect.disabled = false;
+      if (ok) { startBtn.disabled = false; startBtnLarge.disabled = false; }
+      return;
+    }
+    if (bridge) { bridge.close(); bridge = null; usingBridge = false; }
+
+    // RTMW (2D) fp16 variant keeps fp32 IO, so decode/preprocess are unchanged.
+    // rtmw3d has no fp16 variant — always fp32.
+    const fileName = (family === "rtmw" && posePrecision === "fp16") ? "inference_model_fp16.onnx" : "inference_model.onnx";
+    const modelUrl = `/models/${modelId}/${fileName}`;
+    const backends = preferredBackend === "auto"
+      ? ["webgpu", "wasm"]
+      : [preferredBackend];
+
+    session = null;
+    activeBackend = null;
+
+    // Download model with progress (cached after first download)
+    let modelData;
     try {
-      statusEl.childNodes[0].textContent = `Initializing ${meta.label} (${backend})...`;
-      session = await ort.InferenceSession.create(modelData, {
-        executionProviders: [backend],
-        graphOptimizationLevel: "all",
-        enableCpuMemArena: true,
-        enableMemPattern: true,
-      });
-      activeBackend = backend;
-      break;
+      statusEl.childNodes[0].textContent = `Downloading ${meta.label}...`;
+      modelData = await fetchModelWithProgress(modelUrl);
+      hideProgress();
     } catch (e) {
-      console.warn(`${backend} failed:`, e.message);
+      console.error("Model download error:", e);
+      statusEl.childNodes[0].textContent = e.message.includes("not found")
+        ? `Model not found — run export_onnx.py or copy .onnx files to web/public/models/`
+        : `Download failed: ${e.message}`;
+      hideProgress();
+      loading = false;
+      modelSelect.disabled = false;
+      return;
     }
-  }
 
-  if (!session) {
-    statusEl.childNodes[0].textContent = "Failed to load model.";
+    for (const backend of backends) {
+      try {
+        statusEl.childNodes[0].textContent = `Initializing ${meta.label} (${backend})...`;
+        session = await ort.InferenceSession.create(modelData, {
+          executionProviders: [backend],
+          graphOptimizationLevel: "all",
+          enableCpuMemArena: true,
+          enableMemPattern: true,
+        });
+        activeBackend = backend;
+        break;
+      } catch (e) {
+        console.warn(`${backend} failed:`, e.message);
+      }
+    }
+
+    if (!session) {
+      statusEl.childNodes[0].textContent = "Failed to load model.";
+      loading = false;
+      modelSelect.disabled = false;
+      return;
+    }
+
+    hasSegmentation = meta.task === "seg";
+
+    if (isPose) {
+      poseInputBuf = new Float32Array(3 * poseW * poseH);
+      poseCanvas = new OffscreenCanvas(poseW, poseH);
+      poseCtx = poseCanvas.getContext("2d", { willReadFrequently: true });
+      // Reset detector so it (re)loads on the current EP; preload unless debug whole-frame.
+      detSession = null;
+      detLoadFailed = false;
+      if (poseMode !== "exclusive") await ensureDetector();
+      // 3D skeleton viewer — only for rtmw3d.
+      if (is3d) {
+        show3dViewer();
+      } else {
+        setPose3dRunning(false);
+        pose3dCanvas.style.display = "none";
+        pose3dControls.style.display = "none";
+      }
+    } else {
+      inputBuf = new Float32Array(1 * 3 * inputSize * inputSize);
+      prepCanvas = new OffscreenCanvas(inputSize, inputSize);
+      prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
+    }
+
+    const modelType = isPose ? "Pose" : hasSegmentation ? "Seg" : "Det";
+    badgeEl.textContent = activeBackend.toUpperCase();
+    badgeEl.className = activeBackend;
+    const dims = isPose ? `${poseW}x${poseH}` : `${inputSize}px`;
+    statusEl.childNodes[0].textContent = `${meta.label} (${dims}, ${modelType}) `;
+    startBtn.disabled = false;
+    startBtnLarge.disabled = false;
+    modelSelect.disabled = false;
+    loading = false;
+  } finally {
     loading = false;
     modelSelect.disabled = false;
-    return;
+    backendSelect.disabled = false;
+    meshDevice.disabled = false;
+    meshTuningControls.forEach(control => { control.disabled = false; });
   }
-
-  hasSegmentation = meta.task === "seg";
-
-  if (isPose) {
-    poseInputBuf = new Float32Array(3 * poseW * poseH);
-    poseCanvas = new OffscreenCanvas(poseW, poseH);
-    poseCtx = poseCanvas.getContext("2d", { willReadFrequently: true });
-    // Reset detector so it (re)loads on the current EP; preload unless debug whole-frame.
-    detSession = null;
-    detLoadFailed = false;
-    if (poseMode !== "exclusive") await ensureDetector();
-    // 3D skeleton viewer — only for rtmw3d.
-    if (is3d) {
-      pose3dCanvas.style.display = "block";
-      pose3dControls.style.display = "flex";
-      if (!pose3dReady) {
-        initPose3d(pose3dCanvas);
-        // Manual grab takes over: reflect it in the auto-rotate checkbox.
-        onPose3dInteract(() => { autoRotateCb.checked = false; setAutoRotate(false); });
-        pose3dReady = true;
-      }
-      setPose3dRunning(true);
-    } else {
-      setPose3dRunning(false);
-      pose3dCanvas.style.display = "none";
-      pose3dControls.style.display = "none";
-    }
-  } else {
-    inputBuf = new Float32Array(1 * 3 * inputSize * inputSize);
-    prepCanvas = new OffscreenCanvas(inputSize, inputSize);
-    prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
-  }
-
-  const modelType = isPose ? "Pose" : hasSegmentation ? "Seg" : "Det";
-  badgeEl.textContent = activeBackend.toUpperCase();
-  badgeEl.className = activeBackend;
-  const dims = isPose ? `${poseW}x${poseH}` : `${inputSize}px`;
-  statusEl.childNodes[0].textContent = `${meta.label} (${dims}, ${modelType}) `;
-  startBtn.disabled = false;
-  startBtnLarge.disabled = false;
-  modelSelect.disabled = false;
-  loading = false;
 }
 
 async function loadBridgeModel(modelId, meta, backend) {
@@ -556,7 +661,8 @@ async function loadBridgeModel(modelId, meta, backend) {
   try {
     statusEl.childNodes[0].textContent = `Connecting to Python bridge (${serverId})...`;
     bridge = createBridge();
-    const m = await bridge.connect(serverId, threshold);
+    const m = await bridge.connect(serverId, threshold,
+      meta.family === "instanthmr" ? { device: meshDevice.value, fit: Number(meshFit.value), meshOptions: readMeshOptions() } : {});
     if (cutoutMode) bridge.setMatte(true);
     family = m.family;
     activeNames = family === "yolo" ? YOLO_CLASSES : COCO_CLASSES;
@@ -568,6 +674,20 @@ async function loadBridgeModel(modelId, meta, backend) {
     prepCanvas = new OffscreenCanvas(inputSize, inputSize);
     prepCtx = prepCanvas.getContext("2d", { willReadFrequently: true });
 
+    if (m.task === "mesh") {
+      meshFaces = new Uint32Array(m.faces);
+      meshEdges = m.edges;
+      show3dViewer(true);
+      updateMesh3d([], meshFaces);
+      setMeshWireframe(meshWireframe.checked);
+      badgeEl.textContent = `PY·${m.device.toUpperCase()}`;
+      badgeEl.className = "python-mps";
+      syncMeshSmoothingHelp();
+      updateMeshInfo();
+      statusEl.childNodes[0].textContent = `${meta.label} (${m.device}) `;
+      return true;
+    }
+
     badgeEl.textContent = backend === "python-mlx" ? "PY·MLX" : "PY·MPS";
     badgeEl.className = backend;
     const modelType = hasSegmentation ? "Seg" : "Det";
@@ -576,6 +696,7 @@ async function loadBridgeModel(modelId, meta, backend) {
   } catch (e) {
     console.error("bridge load error:", e);
     statusEl.childNodes[0].textContent = e.message;
+    bridge?.close();
     bridge = null;
     usingBridge = false;
     return false;
@@ -585,6 +706,7 @@ async function loadBridgeModel(modelId, meta, backend) {
 async function loadManifest() {
   const res = await fetch("/models/manifest.json");
   manifest = await res.json();
+  manifest.push(...MESH_MODELS);
   for (const m of manifest) {
     const opt = document.createElement("option");
     opt.value = m.id;
@@ -1288,7 +1410,24 @@ window.addEventListener("resize", deferredSyncOverlay);
 
 // --- Main loop ---
 
-async function detectLoop() {
+function detectLoop() {
+  if (!running) return;
+  if (loading || (!session && !usingBridge)) { requestAnimationFrame(detectLoop); return; }
+  frameInFlight = inferFrame().catch(error => {
+    console.error("Inference failed:", error);
+    statusEl.childNodes[0].textContent = error.message;
+    running = false;
+    video.srcObject?.getTracks().forEach(track => track.stop());
+    startBtn.textContent = startBtnLarge.textContent = "Start Camera";
+    meshPersons = [];
+    downloadMesh.disabled = true;
+  }).finally(() => {
+    frameInFlight = null;
+    if (running) requestAnimationFrame(detectLoop);
+  });
+}
+
+async function inferFrame() {
   if (!running) return;
 
   const t0 = performance.now();
@@ -1309,6 +1448,7 @@ async function detectLoop() {
   let posePersons = null;
 
   const isPoseFam = family === "rtmw" || family === "rtmw3d";
+  const isMesh = family === "instanthmr";
 
   if (isPoseFam) {
     // Top-down: pick person box(es), crop each straight from video at the model's
@@ -1349,18 +1489,27 @@ async function detectLoop() {
   } else if (usingBridge) {
     // Native Python inference over the WebSocket. Send the frame, await decoded
     // dets + masks (same shape as the ONNX path), draw with the shared code.
-    prepCtx.drawImage(video, 0, 0, inputSize, inputSize);
-    const imageData = prepCtx.getImageData(0, 0, inputSize, inputSize);
+    const scale = Math.min(1, inputSize / Math.max(vidW, vidH));
+    const width = isMesh ? Math.round(vidW * scale) : inputSize;
+    const height = isMesh ? Math.round(vidH * scale) : inputSize;
+    if (prepCanvas.width !== width || prepCanvas.height !== height) {
+      prepCanvas.width = width;
+      prepCanvas.height = height;
+    }
+    prepCtx.drawImage(video, 0, 0, width, height);
+    const imageData = prepCtx.getImageData(0, 0, width, height);
     tPreprocess = performance.now();
     const buf = await bridge.infer(imageData);
     tInference = performance.now();
-    if (!buf) {                       // disconnected / no result
-      statusEl.childNodes[0].textContent = "Python bridge disconnected.";
-      running = false;
-      return;
-    }
+    // A stopped camera must not publish its last in-flight frame or re-enable export.
+    if (!running) return;
+    if (!buf) throw new Error("Python bridge disconnected.");
     const r = decodeBridgeResult(buf, vidW, vidH);
-    if (r.matte) {
+    if (r.mesh) {
+      meshPersons = r.persons;
+      detections = r.persons;
+      downloadMesh.disabled = !meshPersons.length;
+    } else if (r.matte) {
       // One person-union mask. Wrap as a single synthetic person detection so
       // drawCutout works unchanged (it filters person + unions).
       detections = [{ classId: family === "yolo" ? 0 : 1, queryIdx: 0, score: 1 }];
@@ -1403,7 +1552,12 @@ async function detectLoop() {
     tPostprocess = performance.now();
   }
 
-  if (isPoseFam) {
+  if (!running) return;
+  if (isMesh) {
+    if (meshOverlay.checked) drawMeshOverlay(ctx, meshPersons, meshEdges, vidW, vidH);
+    else ctx.clearRect(0, 0, vidW, vidH);
+    updateMesh3d(meshPersons, meshFaces);
+  } else if (isPoseFam) {
     drawPose(posePersons, vidW, vidH);
     if (family === "rtmw3d") {
       const groups = POSE_GROUPS.map(g => ({ lo: g.lo, hi: g.hi, color: g.color, edges: g.edges, enabled: groupOn(g.key) }));
@@ -1418,12 +1572,12 @@ async function detectLoop() {
 
   let tSidebar = tDraw;
   frameCount++;
-  if (showSegments && !cutoutMode && !isPoseFam && frameCount % 3 === 0) {
+  if (showSegments && !cutoutMode && !isPoseFam && !isMesh && frameCount % 3 === 0) {
     updateSidebar(detections, masksData, maskDims, vidW, vidH);
     tSidebar = performance.now();
   }
 
-  const mode = isPoseFam ? (family === "rtmw3d" ? "pose3d" : "pose") : hasSegmentation ? "seg" : "det";
+  const mode = isMesh ? "mesh" : isPoseFam ? (family === "rtmw3d" ? "pose3d" : "pose") : hasSegmentation ? "seg" : "det";
   // Rolling median per stage (n=60) — same as the python cam HUD, so the two
   // are directly comparable instead of reading jittery instantaneous values.
   const stat = {
@@ -1445,6 +1599,7 @@ async function detectLoop() {
     stat.sParse = sParse;
     stat.sEnc = sEncode + (bridgeServer.maskresize || 0);
     stat.sConv = sPredict - sModel;                // sv mask materialization (predict - pure)
+    if (isMesh) { stat.detector = bridgeServer.detector; stat.hmr = bridgeServer.hmr; }
   }
   pushStat(stat);
   const m = medianStats();
@@ -1455,17 +1610,16 @@ async function detectLoop() {
     `post:${m.post.toFixed(1)}`,
     `draw:${m.draw.toFixed(1)}`,
     `total:${m.total.toFixed(1)}ms (${(1000 / m.total).toFixed(0)}fps)`,
-    `${detections.length}${isPoseFam ? "ppl" : "obj"} ${mode} ${isPoseFam ? `${poseW}x${poseH}` : inputSize + "px"} ${family}`,
+    `${detections.length}${isPoseFam || isMesh ? "ppl" : "obj"} ${mode} ${isPoseFam ? `${poseW}x${poseH}` : inputSize + "px"} ${family}`,
   ];
-  if (usingBridge && bridgeServer) {
+  if (usingBridge && bridgeServer && !isMesh) {
     base.push(
       `‖ rtt:${m.inf.toFixed(1)} = model:${m.model.toFixed(1)} + conv:${m.sConv.toFixed(1)} + ` +
       `enc:${m.sEnc.toFixed(1)} + parse:${m.sParse.toFixed(1)} + wire:${m.wire.toFixed(1)}`
     );
   }
+  if (isMesh) base.push(`detector:${m.detector.toFixed(1)}ms · HMR+mesh:${m.hmr.toFixed(1)}ms`);
   statsEl.textContent = base.join(" | ");
-
-  requestAnimationFrame(detectLoop);
 }
 
 // --- Rolling-median stats (matches python cam-detect HUD) ---
@@ -1502,10 +1656,16 @@ async function startCamera() {
     video.srcObject?.getTracks().forEach(t => t.stop());
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     statsEl.textContent = "";
+    if (family === "instanthmr" && pose3dReady) {
+      updateMesh3d([], meshFaces);
+      meshPersons = [];
+      downloadMesh.disabled = true;
+    }
     placeholder.classList.remove("hidden");
     return;
   }
 
+  await frameInFlight;
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
   });
@@ -1517,6 +1677,7 @@ async function startCamera() {
   await new Promise(r => requestAnimationFrame(r));
   syncOverlay();
 
+  if (family === "instanthmr") await bridge.configureMesh(readMeshOptions(), true);
   running = true;
   startBtn.textContent = "Stop";
   startBtnLarge.textContent = "Stop";

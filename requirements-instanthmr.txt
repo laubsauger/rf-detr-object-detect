@@ -1,0 +1,4 @@
+# Optional InstantHMR integration, in addition to requirements.txt.
+huggingface_hub>=0.30
+onnxruntime==1.26.* ; platform_system == "Darwin"
+onnxruntime-gpu[cuda,cudnn]==1.26.* ; platform_system != "Darwin"

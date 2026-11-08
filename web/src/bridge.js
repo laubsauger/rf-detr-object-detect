@@ -8,35 +8,56 @@
 
 // Same-origin path proxied to the python bridge by vite (see vite.config.js).
 // Same origin + wss on an https page => no mixed-content blocking.
-const BRIDGE_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/bridge`;
+const BRIDGE_URL = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/bridge`;
 
-export function createBridge(url = BRIDGE_URL) {
+export function createBridge(url = BRIDGE_URL()) {
   let ws = null;
   let pending = null;   // resolver for the in-flight infer()
+  let pendingConfig = null;
   let meta = null;      // {family, task, backend, device} from the server
 
-  function connect(modelId, threshold) {
+  function connect(modelId, threshold, options = {}) {
     return new Promise((resolve, reject) => {
       ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => ws.send(JSON.stringify({ type: "model", id: modelId, threshold }));
+      ws.onopen = () => ws.send(JSON.stringify({ type: "model", id: modelId, threshold, ...options }));
       ws.onmessage = (ev) => {
         if (typeof ev.data === "string") {
           const msg = JSON.parse(ev.data);
           if (msg.type === "ready") { meta = msg; resolve(msg); }
+          if (msg.type === "mesh-configured" && pendingConfig) {
+            const p = pendingConfig; pendingConfig = null;
+            meta.meshOptions = msg.options;
+            p.resolve(msg.options);
+          }
+          if (msg.type === "error") {
+            const error = new Error(msg.message);
+            if (msg.request === "mesh-options" && pendingConfig) {
+              const p = pendingConfig; pendingConfig = null; p.reject(error);
+            } else if (pending) { const p = pending; pending = null; p.reject(error); }
+            else reject(error);
+          }
           return;
         }
-        if (pending) { const p = pending; pending = null; p(ev.data); }
+        if (pending) { const p = pending; pending = null; p.resolve(ev.data); }
       };
       ws.onerror = () => reject(new Error(`bridge connection failed (${url}) — is bridge.py running?`));
-      ws.onclose = () => { if (pending) { const p = pending; pending = null; p(null); } };
+      ws.onclose = () => {
+        reject(new Error("Python bridge disconnected before the model was ready."));
+        if (pending) { const p = pending; pending = null; p.resolve(null); }
+        if (pendingConfig) {
+          const p = pendingConfig; pendingConfig = null;
+          p.reject(new Error("Python bridge disconnected while updating smoothing."));
+        }
+      };
     });
   }
 
   // One request in flight (backpressure): caller awaits before sending the next.
   function infer(imageData) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) { resolve(null); return; }
+      if (pending) { reject(new Error("Bridge inference already in progress")); return; }
       const { data, width, height } = imageData;  // RGBA Uint8ClampedArray
       const buf = new Uint8Array(5 + data.length);
       const dv = new DataView(buf.buffer);
@@ -44,7 +65,7 @@ export function createBridge(url = BRIDGE_URL) {
       dv.setUint16(2, height, true);
       buf[4] = 4;  // channels (RGBA)
       buf.set(data, 5);
-      pending = resolve;
+      pending = { resolve, reject };
       ws.send(buf.buffer);
     });
   }
@@ -63,9 +84,23 @@ export function createBridge(url = BRIDGE_URL) {
     }
   }
 
-  function close() { if (ws) { ws.onclose = null; ws.close(); ws = null; } }
+  function configureMesh(options, reset = false) {
+    return new Promise((resolve, reject) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error("Python bridge is disconnected")); return; }
+      if (pendingConfig) { reject(new Error("Mesh configuration already in progress")); return; }
+      pendingConfig = { resolve, reject };
+      ws.send(JSON.stringify({ type: "mesh-options", options, reset }));
+    });
+  }
 
-  return { connect, infer, setThreshold, setMatte, close, get meta() { return meta; } };
+  function close() {
+    if (pending) { pending.resolve(null); pending = null; }
+    if (pendingConfig) { pendingConfig.reject(new Error("Python bridge closed")); pendingConfig = null; }
+    if (ws) { ws.close(); ws = null; }
+    meta = null;
+  }
+
+  return { connect, infer, setThreshold, setMatte, configureMesh, close, get meta() { return meta; } };
 }
 
 // Wire payload -> {detections, masksData, maskDims, speed}. Coords arrive
@@ -75,6 +110,25 @@ export function decodeBridgeResult(buf, vidW, vidH) {
   const dv = new DataView(buf);
   const jsonLen = dv.getUint32(0, true);
   const json = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, jsonLen)));
+
+  if (json.mesh) {
+    let offset = 4 + jsonLen;
+    const persons = json.persons.map(p => {
+      const take = count => {
+        const data = new Float32Array(buf, offset, count);
+        offset += count * 4;
+        return data;
+      };
+      const joints2d = take(p.joints * 2);
+      const joints3d = take(p.joints * 3);
+      const vertices = take(p.vertices * 3);
+      const [x1, y1, x2, y2] = p.bbox;
+      return { joints2d, joints3d, vertices, score: p.score,
+        x1: (1 - x2) * vidW, y1: y1 * vidH, x2: (1 - x1) * vidW, y2: y2 * vidH };
+    });
+    if (offset !== buf.byteLength) throw new Error("Invalid mesh payload length");
+    return { mesh: true, persons, server: json.server };
+  }
 
   // Matte mode: single person-union mask, no boxes.
   if (json.matte) {
